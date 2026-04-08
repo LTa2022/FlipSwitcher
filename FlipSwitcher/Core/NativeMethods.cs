@@ -60,6 +60,10 @@ internal static class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetLayeredWindowAttributes(IntPtr hwnd, out uint pcrKey, out byte pbAlpha, out uint pdwFlags);
+
     [StructLayout(LayoutKind.Sequential)]
     public struct WINDOWPLACEMENT
     {
@@ -256,6 +260,9 @@ internal static class NativeMethods
     public const long WS_EX_TOOLWINDOW = 0x00000080L;
     public const long WS_EX_APPWINDOW = 0x00040000L;
     public const long WS_EX_NOACTIVATE = 0x08000000L;
+    public const long WS_EX_LAYERED = 0x00080000L;
+
+    public const uint LWA_ALPHA = 0x2;
 
     public const uint GW_OWNER = 4;
     public const uint GA_ROOTOWNER = 3;

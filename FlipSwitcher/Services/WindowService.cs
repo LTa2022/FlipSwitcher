@@ -33,7 +33,9 @@ public class WindowService
         "StartMenuExperienceHost",
         "SearchUI",
         "LockApp",
-        "TextInputHost"
+        "TextInputHost",
+        // Bluetooth / tray helper: keeps a visible HWND for message loop; user only interacts via tray icon
+        "BlueTray"
     };
 
     private const int WPF_RESTORETOMAXIMIZED = 0x2;
@@ -41,7 +43,30 @@ public class WindowService
 
     private record struct WindowInfo(string Title, string ClassName, uint ProcessId, string ProcessName);
 
-    private static WindowInfo? TryGetWindowInfo(IntPtr hWnd, IntPtr shellWindow, uint currentProcessId, Dictionary<uint, string> processNameCache)
+    private static bool IsFullyTransparentLayered(IntPtr hWnd, long exStyle)
+    {
+        if ((exStyle & NativeMethods.WS_EX_LAYERED) == 0)
+            return false;
+        if (!NativeMethods.GetLayeredWindowAttributes(hWnd, out _, out byte alpha, out uint flags))
+            return false;
+        return (flags & NativeMethods.LWA_ALPHA) != 0 && alpha == 0;
+    }
+
+    private static bool RectanglesIntersect(NativeMethods.RECT a, NativeMethods.RECT b) =>
+        a.Left < b.Right && a.Right > b.Left && a.Top < b.Bottom && a.Bottom > b.Top;
+
+    private static bool WindowIntersectsAnyMonitor(NativeMethods.RECT windowRect, IReadOnlyList<NativeMethods.RECT> monitorRects)
+    {
+        foreach (var m in monitorRects)
+        {
+            if (RectanglesIntersect(windowRect, m))
+                return true;
+        }
+        return false;
+    }
+
+    private static WindowInfo? TryGetWindowInfo(IntPtr hWnd, IntPtr shellWindow, uint currentProcessId,
+        Dictionary<uint, string> processNameCache, IReadOnlyList<NativeMethods.RECT> monitorRects)
     {
         if (hWnd == shellWindow || !NativeMethods.IsWindowVisible(hWnd))
             return null;
@@ -50,6 +75,11 @@ public class WindowService
             return null;
 
         var exStyle = (long)NativeMethods.GetWindowLongPtr(hWnd, NativeMethods.GWL_EXSTYLE);
+
+        // Tray / ghost hosts: still "visible" to the API but alpha is fully transparent
+        if (IsFullyTransparentLayered(hWnd, exStyle))
+            return null;
+
         if ((exStyle & NativeMethods.WS_EX_TOOLWINDOW) != 0 &&
             (exStyle & NativeMethods.WS_EX_APPWINDOW) == 0)
             return null;
@@ -61,6 +91,12 @@ public class WindowService
 
         // Filter windows that are too small (skip check for minimized windows)
         if (!NativeMethods.IsIconic(hWnd) && !HasValidWindowSize(hWnd))
+            return null;
+
+        // Drop top-level windows parked entirely outside physical monitors (common tray app pattern)
+        if (!NativeMethods.IsIconic(hWnd) && monitorRects.Count > 0 &&
+            NativeMethods.GetWindowRect(hWnd, out var windowRect) &&
+            !WindowIntersectsAnyMonitor(windowRect, monitorRects))
             return null;
 
         NativeMethods.GetWindowThreadProcessId(hWnd, out uint processId);
@@ -137,10 +173,16 @@ public class WindowService
         var elevationCache = new Dictionary<uint, bool>();
 
         var monitors = new List<IntPtr>();
+        var monitorRects = new List<NativeMethods.RECT>();
         NativeMethods.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero,
             (IntPtr hMon, IntPtr hdc, ref NativeMethods.RECT rect, IntPtr data) =>
             {
                 monitors.Add(hMon);
+                var mi = new NativeMethods.MONITORINFO { cbSize = Marshal.SizeOf<NativeMethods.MONITORINFO>() };
+                if (NativeMethods.GetMonitorInfo(hMon, ref mi))
+                    monitorRects.Add(mi.rcMonitor);
+                else
+                    monitorRects.Add(rect);
                 return true;
             }, IntPtr.Zero);
 
@@ -148,7 +190,7 @@ public class WindowService
         {
             try
             {
-                var info = TryGetWindowInfo(hWnd, shellWindow, currentProcessId, processNameCache);
+                var info = TryGetWindowInfo(hWnd, shellWindow, currentProcessId, processNameCache, monitorRects);
                 if (info is null)
                     return true;
 
