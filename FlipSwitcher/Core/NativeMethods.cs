@@ -256,6 +256,8 @@ internal static class NativeMethods
     public const int GWL_EXSTYLE = -20;
 
     public const long WS_VISIBLE = 0x10000000L;
+    /// <summary>WS_BORDER | WS_DLGFRAME — normal windows with a title bar have this.</summary>
+    public const long WS_CAPTION = 0x00C00000L;
     public const long WS_BORDER = 0x00800000L;
     public const long WS_EX_TOOLWINDOW = 0x00000080L;
     public const long WS_EX_APPWINDOW = 0x00040000L;

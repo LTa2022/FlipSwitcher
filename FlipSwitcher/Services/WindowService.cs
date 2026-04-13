@@ -224,19 +224,30 @@ public class WindowService
         }
     }
 
-    private const int MinWindowSize = 50; // Minimum window size threshold
+    private const int MinWindowSize = 50; // Minimum window size threshold (both dimensions)
+    /// <summary>
+    /// When a window is collapsed to a title-bar strip (abnormal layout / user resize),
+    /// <see cref="NativeMethods.GetWindowRect"/> height is often ~30–45px, below <see cref="MinWindowSize"/>.
+    /// </summary>
+    private const int MinCaptionStripHeight = 28;
 
     private static bool HasValidWindowSize(IntPtr hWnd)
     {
         try
         {
-            if (NativeMethods.GetWindowRect(hWnd, out var rect))
-            {
-                var width = rect.Right - rect.Left;
-                var height = rect.Bottom - rect.Top;
-                // Filter windows that are too small (e.g., 2x2 hidden windows)
-                return width >= MinWindowSize && height >= MinWindowSize;
-            }
+            if (!NativeMethods.GetWindowRect(hWnd, out var rect))
+                return false;
+
+            var width = rect.Right - rect.Left;
+            var height = rect.Bottom - rect.Top;
+            if (width >= MinWindowSize && height >= MinWindowSize)
+                return true;
+
+            var style = (long)NativeMethods.GetWindowLongPtr(hWnd, NativeMethods.GWL_STYLE);
+            var hasCaption = (style & NativeMethods.WS_CAPTION) == NativeMethods.WS_CAPTION;
+            if (hasCaption && width >= MinWindowSize && height >= MinCaptionStripHeight)
+                return true;
+
             return false;
         }
         catch
