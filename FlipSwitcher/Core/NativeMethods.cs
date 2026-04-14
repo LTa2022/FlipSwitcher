@@ -264,6 +264,7 @@ internal static class NativeMethods
     public const long WS_EX_NOACTIVATE = 0x08000000L;
     public const long WS_EX_LAYERED = 0x00080000L;
 
+    public const uint LWA_COLORKEY = 0x1;
     public const uint LWA_ALPHA = 0x2;
 
     public const uint GW_OWNER = 4;
@@ -404,4 +405,3 @@ internal static class NativeMethods
 
     #endregion
 }
-
