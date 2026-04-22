@@ -74,3 +74,6 @@ publish/
 .Spotlight-V100
 .Trashes
 
+node_modules/
+dist/
+.vite/
