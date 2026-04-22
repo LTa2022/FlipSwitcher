@@ -33,9 +33,7 @@ public class WindowService
         "StartMenuExperienceHost",
         "SearchUI",
         "LockApp",
-        "TextInputHost",
-        // Bluetooth / tray helper: keeps a visible HWND for message loop; user only interacts via tray icon
-        "BlueTray"
+        "TextInputHost"
     };
 
     private const int WPF_RESTORETOMAXIMIZED = 0x2;
@@ -43,13 +41,50 @@ public class WindowService
 
     private record struct WindowInfo(string Title, string ClassName, uint ProcessId, string ProcessName);
 
+    /// <summary>
+    /// Returns true when a layered window is invisible to the user and should be excluded
+    /// from the switcher, covering three cases that share the same "user cannot see this" property:
+    /// <list type="bullet">
+    ///   <item><description>
+    ///     <c>flags == 0</c> — <c>WS_EX_LAYERED</c> was set but <c>SetLayeredWindowAttributes</c> was
+    ///     never called. Win32 renders such a window as fully transparent by default. This is the
+    ///     pattern used by tray-only helper processes that create an HWND purely as a message-loop
+    ///     anchor (e.g. Bluetooth tray daemons, audio endpoint helpers).
+    ///   </description></item>
+    ///   <item><description>
+    ///     <c>LWA_ALPHA</c> with <c>alpha == 0</c> — explicitly blended to fully transparent.
+    ///   </description></item>
+    ///   <item><description>
+    ///     <c>LWA_COLORKEY</c> without <c>LWA_ALPHA</c> — the entire client area is punched out by a
+    ///     chroma key; there is no visible pixel content for the user to interact with.
+    ///   </description></item>
+    /// </list>
+    /// Note: if <c>GetLayeredWindowAttributes</c> fails the window uses <c>UpdateLayeredWindow</c>
+    /// (e.g. WPF <c>AllowsTransparency</c>) and may be genuinely visible — leave those alone.
+    /// </summary>
     private static bool IsFullyTransparentLayered(IntPtr hWnd, long exStyle)
     {
         if ((exStyle & NativeMethods.WS_EX_LAYERED) == 0)
             return false;
+
+        // Failure means the window drives its own compositing via UpdateLayeredWindow – not a ghost.
         if (!NativeMethods.GetLayeredWindowAttributes(hWnd, out _, out byte alpha, out uint flags))
             return false;
-        return (flags & NativeMethods.LWA_ALPHA) != 0 && alpha == 0;
+
+        // flags == 0: WS_EX_LAYERED set but SetLayeredWindowAttributes never called →
+        // Win32 default is fully transparent; typical message-loop anchor pattern for tray daemons.
+        if (flags == 0)
+            return true;
+
+        // Explicitly blended to fully transparent.
+        if ((flags & NativeMethods.LWA_ALPHA) != 0 && alpha == 0)
+            return true;
+
+        // Color-key only (no alpha channel): entire surface is chroma-keyed out, nothing visible.
+        if ((flags & NativeMethods.LWA_ALPHA) == 0 && (flags & NativeMethods.LWA_COLORKEY) != 0)
+            return true;
+
+        return false;
     }
 
     private static bool RectanglesIntersect(NativeMethods.RECT a, NativeMethods.RECT b) =>
@@ -275,4 +310,3 @@ public class WindowService
         }
     }
 }
-
