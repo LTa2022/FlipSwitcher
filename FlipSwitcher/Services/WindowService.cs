@@ -268,15 +268,12 @@ public class WindowService
                 info.Value.ProcessId, info.Value.ProcessName, isMinimized, isMaximized,
                 _monitors, _elevationCache);
 
-            // Pre-populate icon synchronously if the global cache already knows it — avoids
-            // the brief "icon flashes in" effect on subsequent activations.
-            var exePath = IconCacheService.Instance.GetProcessPath(info.Value.ProcessId);
-            if (!string.IsNullOrEmpty(exePath) &&
-                IconCacheService.Instance.TryGetExeIcon(exePath, out var cachedIcon) &&
-                cachedIcon != null)
-            {
-                window.TrySetCachedIcon(cachedIcon);
-            }
+            // Note: we deliberately do not pre-populate the icon from the per-exe cache here.
+            // Several distinct windows can share an executable but have different icons —
+            // most notably File Explorer and Control Panel both run in explorer.exe and would
+            // alias each other if pre-filled. AppWindow loads its own icon asynchronously and
+            // only consults the per-exe cache via paths that are genuinely exe-wide
+            // (SHGetFileInfo, ExtractAssociatedIcon, UWP manifest).
 
             _windowInstanceCache[hWnd] = window;
             _windowsScratch.Add(window);

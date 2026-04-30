@@ -150,8 +150,9 @@ public class AppWindow : INotifyPropertyChanged
     }
 
     /// <summary>
-    /// Icon for this window. Resolved synchronously from <see cref="IconCacheService"/> if available;
-    /// otherwise loaded asynchronously and pushed back via property change.
+    /// Icon for this window. Loaded asynchronously on first access; subsequent gets return
+    /// the cached value on the instance. Because <see cref="Services.WindowService"/> reuses
+    /// AppWindow instances across refreshes, the icon survives switcher re-opens.
     /// </summary>
     public ImageSource? Icon
     {
@@ -160,16 +161,11 @@ public class AppWindow : INotifyPropertyChanged
             if (_icon != null) return _icon;
             if (_iconLoading) return null;
 
-            // Fast path: cache hit.
-            var iconCache = IconCacheService.Instance;
-            var exePath = iconCache.GetProcessPath(ProcessId);
-            if (!string.IsNullOrEmpty(exePath) && iconCache.TryGetExeIcon(exePath, out var cached) && cached != null)
-            {
-                _icon = cached;
-                return _icon;
-            }
-
-            // Slow path: kick off async load.
+            // Note: we deliberately do NOT consult the global IconCacheService here. The fast-path
+            // would incorrectly hit for windows that share an executable but have distinct icons
+            // (e.g. File Explorer, Control Panel and the Recycle Bin all run inside explorer.exe
+            // but expose different icons via WM_GETICON). LoadIcon() consults the cache only for
+            // the genuinely shared per-exe shell icon — never for per-window icons.
             _iconLoading = true;
             _ = LoadIconAsync();
             return null;
@@ -177,14 +173,14 @@ public class AppWindow : INotifyPropertyChanged
     }
 
     /// <summary>
-    /// Pre-populate the icon from a known cached value (used by <see cref="WindowService"/> when
-    /// it can hand us an already-cached icon without having to spin up an async load).
+    /// Pre-populate the icon from a known cached value (used by <see cref="Services.WindowService"/>
+    /// when an existing AppWindow instance is being reused). Should NOT be called with a value
+    /// derived from <c>WM_GETICON</c> on a different window.
     /// </summary>
     internal void TrySetCachedIcon(ImageSource? icon)
     {
         if (icon == null || _icon != null) return;
         _icon = icon;
-        // No PropertyChanged needed — caller is constructing the instance fresh, no UI bound yet.
     }
 
     private async Task LoadIconAsync()
@@ -293,42 +289,36 @@ public class AppWindow : INotifyPropertyChanged
     private ImageSource? LoadIcon()
     {
         var iconCache = IconCacheService.Instance;
-
-        // 0. Try cache first by exe path.
         var exePath = iconCache.GetProcessPath(ProcessId);
-        if (!string.IsNullOrEmpty(exePath) && iconCache.TryGetExeIcon(exePath, out var cached) && cached != null)
-            return cached;
 
-        // UWP apps use a dedicated path.
+        // UWP apps use a dedicated path. UWP icons are package-wide so cache by app dir.
         if (IsUwpWindow)
         {
             var uwpIcon = LoadUwpIcon();
             if (uwpIcon != null) return uwpIcon;
         }
 
-        // 1. Window icon handle (fastest, may be document-specific).
+        // 1. Window icon handle (WM_GETICON / GCL_HICON).
+        // This may be a per-window icon (e.g. File Explorer's folder icon vs. Control Panel's
+        // gear icon — both running inside explorer.exe). NEVER write this into the per-exe cache,
+        // or the icons of every window in the process get cross-contaminated.
         var iconHandle = GetWindowIconHandle();
         if (iconHandle != IntPtr.Zero)
         {
             var icon = IconCacheService.IconHandleToImageSource(iconHandle);
             if (icon != null)
-            {
-                // WM_GETICON handles are owned by the target process — do not destroy.
-                // Cache against exe so the next window of the same app gets a hit immediately.
-                if (!string.IsNullOrEmpty(exePath))
-                    iconCache.SetExeIcon(exePath, icon);
                 return icon;
-            }
         }
 
-        // 2. Shell API (reliable, caches internally).
+        // 2. Shell API — this returns the icon associated with the executable on disk, which
+        // is genuinely shared across all windows of the same exe. Safe (and beneficial) to cache.
         if (!string.IsNullOrEmpty(exePath))
         {
-            var icon = iconCache.LoadIconFromShell(exePath);
+            var icon = iconCache.LoadIconFromShell(exePath); // caches internally
             if (icon != null) return icon;
         }
 
-        // 3. Extract from process module (last resort).
+        // 3. Extract from process module (last resort). Also exe-wide; safe to cache.
         try
         {
             if (!string.IsNullOrEmpty(exePath))
@@ -337,7 +327,7 @@ public class AppWindow : INotifyPropertyChanged
                 if (ico != null)
                 {
                     var icon = IconCacheService.IconHandleToImageSource(ico.Handle);
-                    if (icon != null && !string.IsNullOrEmpty(exePath))
+                    if (icon != null)
                         iconCache.SetExeIcon(exePath, icon);
                     return icon;
                 }
