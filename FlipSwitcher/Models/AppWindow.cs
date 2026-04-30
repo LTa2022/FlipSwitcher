@@ -1,22 +1,23 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows;
-using System.Windows.Interop;
 using System.Windows.Media;
-using System.Windows.Media.Imaging;
-using System.Xml.Linq;
 using FlipSwitcher.Core;
+using FlipSwitcher.Services;
 
 namespace FlipSwitcher.Models;
 
 /// <summary>
-/// Represents a window that can be switched to
+/// Represents a window that can be switched to.
+/// Icons and pinyin transliterations are resolved through global caches
+/// (<see cref="IconCacheService"/>, <see cref="PinyinService"/>) so that
+/// re-creating <see cref="AppWindow"/> instances on every refresh stays cheap.
 /// </summary>
 public class AppWindow : INotifyPropertyChanged
 {
@@ -25,12 +26,8 @@ public class AppWindow : INotifyPropertyChanged
     private bool _iconLoading;
     private bool? _isElevated;
     private int? _monitorNumber;
-    private readonly System.Collections.Generic.List<IntPtr>? _monitors;
-    private readonly System.Collections.Generic.Dictionary<uint, bool>? _elevationCache;
-    private string? _titlePinyinInitials;
-    private string? _titleFullPinyin;
-    private string? _processNamePinyinInitials;
-    private string? _processNameFullPinyin;
+    private readonly List<IntPtr>? _monitors;
+    private readonly Dictionary<uint, bool>? _elevationCache;
 
     public IntPtr Handle { get; }
     public string Title { get; }
@@ -41,7 +38,7 @@ public class AppWindow : INotifyPropertyChanged
     public bool IsMaximized { get; }
 
     /// <summary>
-    /// Whether the window's process is running with administrator privileges
+    /// Whether the window's process is running with administrator privileges.
     /// </summary>
     public bool IsElevated
     {
@@ -62,7 +59,7 @@ public class AppWindow : INotifyPropertyChanged
     }
 
     /// <summary>
-    /// The monitor number (1-based) where this window is located
+    /// The monitor number (1-based) where this window is located.
     /// </summary>
     public int MonitorNumber
     {
@@ -84,9 +81,10 @@ public class AppWindow : INotifyPropertyChanged
             return index >= 0 ? index + 1 : 1;
         }
 
-        // Fallback: enumerate independently (should not reach here)
-        var monitors = new System.Collections.Generic.List<IntPtr>();
-        NativeMethods.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (IntPtr hMon, IntPtr hdc, ref NativeMethods.RECT rect, IntPtr data) =>
+        // Fallback: enumerate independently (should not reach here normally).
+        var monitors = new List<IntPtr>();
+        NativeMethods.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero,
+            (IntPtr hMon, IntPtr hdc, ref NativeMethods.RECT rect, IntPtr data) =>
         {
             monitors.Add(hMon);
             return true;
@@ -129,7 +127,7 @@ public class AppWindow : INotifyPropertyChanged
         }
         catch
         {
-            // Assume normal privileges if detection fails
+            // Assume normal privileges if detection fails.
         }
         finally
         {
@@ -151,28 +149,47 @@ public class AppWindow : INotifyPropertyChanged
         }
     }
 
+    /// <summary>
+    /// Icon for this window. Resolved synchronously from <see cref="IconCacheService"/> if available;
+    /// otherwise loaded asynchronously and pushed back via property change.
+    /// </summary>
     public ImageSource? Icon
     {
         get
         {
-            if (_icon == null && !_iconLoading)
+            if (_icon != null) return _icon;
+            if (_iconLoading) return null;
+
+            // Fast path: cache hit.
+            var iconCache = IconCacheService.Instance;
+            var exePath = iconCache.GetProcessPath(ProcessId);
+            if (!string.IsNullOrEmpty(exePath) && iconCache.TryGetExeIcon(exePath, out var cached) && cached != null)
             {
-                _iconLoading = true;
-                _ = LoadIconAsync();
+                _icon = cached;
+                return _icon;
             }
-            return _icon;
+
+            // Slow path: kick off async load.
+            _iconLoading = true;
+            _ = LoadIconAsync();
+            return null;
         }
+    }
+
+    /// <summary>
+    /// Pre-populate the icon from a known cached value (used by <see cref="WindowService"/> when
+    /// it can hand us an already-cached icon without having to spin up an async load).
+    /// </summary>
+    internal void TrySetCachedIcon(ImageSource? icon)
+    {
+        if (icon == null || _icon != null) return;
+        _icon = icon;
+        // No PropertyChanged needed — caller is constructing the instance fresh, no UI bound yet.
     }
 
     private async Task LoadIconAsync()
     {
-        var icon = await Task.Run(() =>
-        {
-            var result = LoadIcon();
-            if (result is { IsFrozen: false, CanFreeze: true })
-                result.Freeze();
-            return result;
-        });
+        var icon = await Task.Run(LoadIcon);
 
         if (icon != null)
         {
@@ -181,11 +198,14 @@ public class AppWindow : INotifyPropertyChanged
                 System.Windows.Threading.DispatcherPriority.Background,
                 new Action(() => OnPropertyChanged(nameof(Icon))));
         }
+        _iconLoading = false;
     }
 
     public string FormattedTitle => string.IsNullOrWhiteSpace(Title) ? ProcessName : Title;
 
-    public AppWindow(IntPtr handle, string title, string className, uint processId, string processName, bool isMinimized, bool isMaximized, System.Collections.Generic.List<IntPtr>? monitors = null, System.Collections.Generic.Dictionary<uint, bool>? elevationCache = null)
+    public AppWindow(IntPtr handle, string title, string className, uint processId, string processName,
+        bool isMinimized, bool isMaximized,
+        List<IntPtr>? monitors = null, Dictionary<uint, bool>? elevationCache = null)
     {
         Handle = handle;
         Title = title;
@@ -202,27 +222,16 @@ public class AppWindow : INotifyPropertyChanged
 
     private bool IsUwpWindow => ClassName == "ApplicationFrameWindow";
 
-    // Convert icon handle to ImageSource
-    private static ImageSource? IconHandleToImageSource(IntPtr iconHandle, bool destroyAfter = false)
-    {
-        if (iconHandle == IntPtr.Zero) return null;
-        try
-        {
-            using var icon = System.Drawing.Icon.FromHandle(iconHandle);
-            using var cloned = (System.Drawing.Icon)icon.Clone();
-            var source = Imaging.CreateBitmapSourceFromHIcon(cloned.Handle, Int32Rect.Empty, BitmapSizeOptions.FromEmptyOptions());
-            if (source is { IsFrozen: false, CanFreeze: true })
-                source.Freeze();
-            return source;
-        }
-        catch { return null; }
-        finally { if (destroyAfter) NativeMethods.DestroyIcon(iconHandle); }
-    }
+    /// <summary>
+    /// Cache key used for HWND-specific icons (those obtained via WM_GETICON that may differ from
+    /// the per-exe icon — e.g. document-specific icons in some IDEs). Falls back to exe-keyed cache.
+    /// </summary>
+    private string GetWindowIconCacheKey() => $"hwnd:{Handle.ToInt64()}";
 
-    // Get icon handle via window messages
+    // Get icon handle via window messages (may be document-specific).
     private IntPtr GetWindowIconHandle()
     {
-        // Prefer ICON_BIG, skip ICON_SMALL2 (rarely used)
+        // Prefer ICON_BIG, skip ICON_SMALL2 (rarely used).
         NativeMethods.SendMessageTimeout(Handle, NativeMethods.WM_GETICON, (IntPtr)NativeMethods.ICON_BIG, IntPtr.Zero,
             NativeMethods.SMTO_ABORTIFHUNG, IconTimeoutMs, out var h);
         if (h != IntPtr.Zero) return h;
@@ -235,103 +244,14 @@ public class AppWindow : INotifyPropertyChanged
         return h != IntPtr.Zero ? h : NativeMethods.GetClassLongPtr(Handle, NativeMethods.GCL_HICONSM);
     }
 
-    // Get process executable path
-    private string? GetProcessPath(uint processId)
-    {
-        var hProcess = NativeMethods.OpenProcess(NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
-        if (hProcess == IntPtr.Zero) return null;
-        try
-        {
-            var buffer = new StringBuilder(260);
-            int size = buffer.Capacity;
-            return NativeMethods.QueryFullProcessImageName(hProcess, 0, buffer, ref size) ? buffer.ToString() : null;
-        }
-        finally { NativeMethods.CloseHandle(hProcess); }
-    }
-
-    // Load icon via Shell API (works for all apps including UWP)
-    private ImageSource? LoadIconFromShell(string filePath)
-    {
-        var shinfo = new NativeMethods.SHFILEINFO();
-        var result = NativeMethods.SHGetFileInfo(filePath, 0, ref shinfo,
-            (uint)System.Runtime.InteropServices.Marshal.SizeOf(shinfo),
-            NativeMethods.SHGFI_ICON | NativeMethods.SHGFI_LARGEICON);
-        return result != 0 ? IconHandleToImageSource(shinfo.hIcon, destroyAfter: true) : null;
-    }
-
-    // Load icon from image file (UWP manifest resource)
-    private ImageSource? LoadIconFromImageFile(string imagePath)
-    {
-        if (!File.Exists(imagePath)) return null;
-        try
-        {
-            var bitmap = new BitmapImage();
-            bitmap.BeginInit();
-            bitmap.UriSource = new Uri(imagePath, UriKind.Absolute);
-            bitmap.CacheOption = BitmapCacheOption.OnLoad;
-            bitmap.DecodePixelWidth = 48;
-            bitmap.EndInit();
-            bitmap.Freeze();
-            return bitmap;
-        }
-        catch { return null; }
-    }
-
-    // UWP: load icon from AppxManifest
-    private ImageSource? LoadIconFromAppxManifest(string appDir)
-    {
-        var manifestPath = Path.Combine(appDir, "AppxManifest.xml");
-        if (!File.Exists(manifestPath)) return null;
-
-        try
-        {
-            var doc = XDocument.Load(manifestPath);
-            var visualElements = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "VisualElements");
-            
-            // Try multiple logo attributes
-            string?[] logoAttrs = [
-                visualElements?.Attribute("Square44x44Logo")?.Value,
-                visualElements?.Attribute("Square150x150Logo")?.Value,
-                visualElements?.Attribute("Square71x71Logo")?.Value
-            ];
-            
-            var logoPath = logoAttrs.FirstOrDefault(p => !string.IsNullOrEmpty(p));
-            if (string.IsNullOrEmpty(logoPath))
-            {
-                var logoElement = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "Logo" && e.Parent?.Name.LocalName == "Properties");
-                logoPath = logoElement?.Value;
-            }
-            if (string.IsNullOrEmpty(logoPath)) return null;
-
-            var baseLogoPath = Path.Combine(appDir, logoPath);
-            var logoDir = Path.GetDirectoryName(baseLogoPath);
-            var logoName = Path.GetFileNameWithoutExtension(baseLogoPath);
-            var logoExt = Path.GetExtension(baseLogoPath);
-
-            if (string.IsNullOrEmpty(logoDir)) return null;
-
-            // Try common variants (prefer larger sizes and unplated)
-            string[] suffixes = [
-                ".targetsize-256_altform-unplated", ".targetsize-256",
-                ".targetsize-64_altform-unplated", ".targetsize-64",
-                ".targetsize-48_altform-unplated", ".targetsize-48",
-                ".targetsize-32_altform-unplated", ".targetsize-32",
-                ".scale-200", ".scale-100", ""
-            ];
-            foreach (var suffix in suffixes)
-            {
-                var icon = LoadIconFromImageFile(Path.Combine(logoDir, $"{logoName}{suffix}{logoExt}"));
-                if (icon != null) return icon;
-            }
-            return LoadIconFromImageFile(baseLogoPath);
-        }
-        catch { return null; }
-    }
-
-    // UWP icon loading
+    /// <summary>
+    /// UWP icon loading. Manifest parsing and suffix probing are cached in <see cref="IconCacheService"/>.
+    /// </summary>
     private ImageSource? LoadUwpIcon()
     {
-        // Get the real UWP process ID (try multiple child window classes)
+        var iconCache = IconCacheService.Instance;
+
+        // Get the real UWP process ID (try multiple child window classes).
         uint uwpPid = ProcessId;
         string[] childClasses = ["Windows.UI.Core.CoreWindow", "Windows.UI.Composition.DesktopWindowContentBridge"];
         foreach (var cls in childClasses)
@@ -348,54 +268,79 @@ public class AppWindow : INotifyPropertyChanged
             }
         }
 
-        var exePath = GetProcessPath(uwpPid);
+        var exePath = iconCache.GetProcessPath(uwpPid);
         if (string.IsNullOrEmpty(exePath)) return null;
 
+        // Cache key for UWP is the app directory (manifest is per-package).
         var appDir = Path.GetDirectoryName(exePath);
-        
-        // Prefer manifest (more accurate)
         if (!string.IsNullOrEmpty(appDir))
         {
-            var icon = LoadIconFromAppxManifest(appDir);
-            if (icon != null) return icon;
+            if (iconCache.TryGetExeIcon(appDir, out var cached) && cached != null)
+                return cached;
+
+            var icon = iconCache.LoadIconFromAppxManifest(appDir);
+            if (icon != null)
+            {
+                iconCache.SetExeIcon(appDir, icon);
+                return icon;
+            }
         }
 
-        // Fallback: Shell API
-        return LoadIconFromShell(exePath);
+        // Fallback: Shell API (cached internally against exePath).
+        return iconCache.LoadIconFromShell(exePath);
     }
 
     private ImageSource? LoadIcon()
     {
-        // UWP apps use a dedicated path
+        var iconCache = IconCacheService.Instance;
+
+        // 0. Try cache first by exe path.
+        var exePath = iconCache.GetProcessPath(ProcessId);
+        if (!string.IsNullOrEmpty(exePath) && iconCache.TryGetExeIcon(exePath, out var cached) && cached != null)
+            return cached;
+
+        // UWP apps use a dedicated path.
         if (IsUwpWindow)
         {
             var uwpIcon = LoadUwpIcon();
             if (uwpIcon != null) return uwpIcon;
         }
 
-        // 1. Window icon handle (fastest)
+        // 1. Window icon handle (fastest, may be document-specific).
         var iconHandle = GetWindowIconHandle();
         if (iconHandle != IntPtr.Zero)
         {
-            var icon = IconHandleToImageSource(iconHandle);
-            if (icon != null) return icon;
+            var icon = IconCacheService.IconHandleToImageSource(iconHandle);
+            if (icon != null)
+            {
+                // WM_GETICON handles are owned by the target process — do not destroy.
+                // Cache against exe so the next window of the same app gets a hit immediately.
+                if (!string.IsNullOrEmpty(exePath))
+                    iconCache.SetExeIcon(exePath, icon);
+                return icon;
+            }
         }
 
-        // 2. Shell API (reliable)
-        var exePath = GetProcessPath(ProcessId);
+        // 2. Shell API (reliable, caches internally).
         if (!string.IsNullOrEmpty(exePath))
         {
-            var icon = LoadIconFromShell(exePath);
+            var icon = iconCache.LoadIconFromShell(exePath);
             if (icon != null) return icon;
         }
 
-        // 3. Extract from process module (last resort)
+        // 3. Extract from process module (last resort).
         try
         {
             if (!string.IsNullOrEmpty(exePath))
             {
                 using var ico = System.Drawing.Icon.ExtractAssociatedIcon(exePath);
-                if (ico != null) return IconHandleToImageSource(ico.Handle);
+                if (ico != null)
+                {
+                    var icon = IconCacheService.IconHandleToImageSource(ico.Handle);
+                    if (icon != null && !string.IsNullOrEmpty(exePath))
+                        iconCache.SetExeIcon(exePath, icon);
+                    return icon;
+                }
             }
         }
         catch { }
@@ -412,7 +357,7 @@ public class AppWindow : INotifyPropertyChanged
         var currentThreadId = NativeMethods.GetCurrentThreadId();
         var targetThreadId = NativeMethods.GetWindowThreadProcessId(Handle, out _);
 
-        // Avoid modifying global SPI_SETFOREGROUNDLOCKTIMEOUT to prevent permanently altering system behavior on crash
+        // Avoid modifying global SPI_SETFOREGROUNDLOCKTIMEOUT to prevent permanently altering system behavior on crash.
         NativeMethods.AllowSetForegroundWindow(NativeMethods.ASFW_ANY);
         NativeMethods.LockSetForegroundWindow(NativeMethods.LSFW_UNLOCK);
 
@@ -434,12 +379,12 @@ public class AppWindow : INotifyPropertyChanged
             var placement = new NativeMethods.WINDOWPLACEMENT();
             placement.length = System.Runtime.InteropServices.Marshal.SizeOf(placement);
             NativeMethods.GetWindowPlacement(Handle, ref placement);
-            
-            bool wasMaximized = placement.showCmd == NativeMethods.SW_SHOWMAXIMIZED_PLACEMENT || 
-                                NativeMethods.IsZoomed(Handle) || 
+
+            bool wasMaximized = placement.showCmd == NativeMethods.SW_SHOWMAXIMIZED_PLACEMENT ||
+                                NativeMethods.IsZoomed(Handle) ||
                                 IsMaximized;
-            bool wasMinimized = placement.showCmd == NativeMethods.SW_SHOWMINIMIZED || 
-                                NativeMethods.IsIconic(Handle) || 
+            bool wasMinimized = placement.showCmd == NativeMethods.SW_SHOWMINIMIZED ||
+                                NativeMethods.IsIconic(Handle) ||
                                 IsMinimized;
 
             if (wasMinimized)
@@ -490,7 +435,7 @@ public class AppWindow : INotifyPropertyChanged
             }
             catch
             {
-                // Ignore all errors in fallback
+                // Ignore all errors in fallback.
             }
         }
         finally
@@ -517,22 +462,18 @@ public class AppWindow : INotifyPropertyChanged
 
         if (Services.SettingsService.Instance.Settings.EnablePinyinSearch)
         {
+            // Pinyin caches live in PinyinService and are keyed by the original string,
+            // so they survive across AppWindow re-instantiation (window list refresh).
+            var pinyin = Services.PinyinService.Instance;
             var lowerFilter = filter.ToLowerInvariant();
 
-            _titlePinyinInitials ??= Services.PinyinService.Instance.GetPinyinInitials(Title).ToLowerInvariant();
-            if (_titlePinyinInitials.Contains(lowerFilter))
+            if (pinyin.GetPinyinInitials(Title).Contains(lowerFilter, StringComparison.Ordinal))
                 return true;
-
-            _titleFullPinyin ??= Services.PinyinService.Instance.GetFullPinyin(Title).ToLowerInvariant();
-            if (_titleFullPinyin.Contains(lowerFilter))
+            if (pinyin.GetFullPinyin(Title).Contains(lowerFilter, StringComparison.Ordinal))
                 return true;
-
-            _processNamePinyinInitials ??= Services.PinyinService.Instance.GetPinyinInitials(ProcessName).ToLowerInvariant();
-            if (_processNamePinyinInitials.Contains(lowerFilter))
+            if (pinyin.GetPinyinInitials(ProcessName).Contains(lowerFilter, StringComparison.Ordinal))
                 return true;
-
-            _processNameFullPinyin ??= Services.PinyinService.Instance.GetFullPinyin(ProcessName).ToLowerInvariant();
-            if (_processNameFullPinyin.Contains(lowerFilter))
+            if (pinyin.GetFullPinyin(ProcessName).Contains(lowerFilter, StringComparison.Ordinal))
                 return true;
         }
 
@@ -540,7 +481,7 @@ public class AppWindow : INotifyPropertyChanged
     }
 
     /// <summary>
-    /// Close this window by sending WM_CLOSE message
+    /// Close this window by sending WM_CLOSE message.
     /// </summary>
     public void Close()
     {
@@ -550,7 +491,7 @@ public class AppWindow : INotifyPropertyChanged
         }
         catch
         {
-            // Ignore errors when closing window
+            // Ignore errors when closing window.
         }
     }
 
@@ -561,4 +502,3 @@ public class AppWindow : INotifyPropertyChanged
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
     }
 }
-

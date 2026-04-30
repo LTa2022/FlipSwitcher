@@ -35,6 +35,7 @@ public class ThemeService
     private volatile bool _isFollowingSystemTheme = false;
     private AppTheme? _currentAppliedTheme = null; // null means not yet initialized
     private volatile bool _isApplyingTheme = false;
+    private int? _lastSystemThemeValue; // last AppsUseLightTheme value seen — avoids redundant ApplyTheme
 
     private ThemeService()
     {
@@ -133,6 +134,14 @@ public class ThemeService
         if (e.Category != UserPreferenceCategory.General) return;
         if (!_isFollowingSystemTheme || _isApplyingTheme) return;
 
+        // UserPreferenceChanged(General) fires for many unrelated changes (mouse settings,
+        // accent color, etc.). Re-applying the entire theme dictionary on every such event
+        // is expensive — DynamicResource lookups across all bound elements re-evaluate.
+        // Skip unless the AppsUseLightTheme value actually changed since we last looked.
+        var newValue = GetSystemThemeValue();
+        if (newValue == _lastSystemThemeValue) return;
+        _lastSystemThemeValue = newValue;
+
         var app = Application.Current;
         app?.Dispatcher.BeginInvoke(() =>
         {
@@ -144,6 +153,7 @@ public class ThemeService
     private void ApplySystemTheme()
     {
         var themeValue = GetSystemThemeValue();
+        _lastSystemThemeValue = themeValue;
         bool isLightTheme = themeValue == 1;
         AppTheme theme = isLightTheme ? AppTheme.Light : AppTheme.Dark;
         ApplyTheme(theme);

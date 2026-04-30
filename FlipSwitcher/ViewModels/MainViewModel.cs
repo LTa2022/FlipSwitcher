@@ -1,8 +1,10 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Linq;
 using System.Windows.Input;
+using System.Windows.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using FlipSwitcher.Models;
@@ -11,32 +13,64 @@ using FlipSwitcher.Services;
 namespace FlipSwitcher.ViewModels;
 
 /// <summary>
-/// ViewModel for the main window switcher
+/// ViewModel for the main window switcher.
 /// </summary>
+/// <remarks>
+/// Performance notes (rev 2):
+/// <list type="bullet">
+///   <item><c>_windows</c> is now a plain <see cref="List{T}"/> — it is never bound to the UI,
+///         only used as the source for filtering. <c>FilteredWindows</c> is the only
+///         <see cref="ObservableCollection{T}"/> in this VM.</item>
+///   <item><see cref="SearchText"/> setter no longer filters synchronously. Instead it kicks
+///         off a <see cref="DispatcherTimer"/> that coalesces rapid key strokes into a single
+///         filter pass.</item>
+///   <item><see cref="UpdateFilteredWindows"/> reworked: in the common case the order matches
+///         the previous list (we just diff in place); otherwise we Clear + AddRange. This
+///         avoids the O(n²) Insert/RemoveAt notification storm of the previous diff.</item>
+/// </list>
+/// </remarks>
 public class MainViewModel : ObservableObject, IDisposable
 {
     private readonly WindowService _windowService;
     private string _searchText = string.Empty;
     private AppWindow? _selectedWindow;
-    private ObservableCollection<AppWindow> _windows = new();
+    private List<AppWindow> _windows = new();
     private ObservableCollection<AppWindow> _filteredWindows = new();
     private bool _isGroupedByProcess;
     private string? _groupedProcessName;
     private AppWindow? _lastSelectedWindowBeforeGrouping;
+
+    // Debounce timer for SearchText. Idle filter passes are cheap on small lists, but
+    // typing 5 characters quickly on a list with pinyin enabled used to trigger 5 full
+    // pinyin computations — this collapses to one.
+    private readonly DispatcherTimer _searchDebounceTimer;
+    private const int SearchDebounceMs = 30;
 
     public bool ShowMonitorInfo => SettingsService.Instance.Settings.ShowMonitorInfo;
 
     public MainViewModel()
     {
         _windowService = new WindowService();
-        
+
         SwitchToWindowCommand = new RelayCommand<AppWindow>(SwitchToWindow);
         RefreshWindowsCommand = new RelayCommand(() => RefreshWindows());
         MoveSelectionUpCommand = new RelayCommand(MoveSelectionUp);
         MoveSelectionDownCommand = new RelayCommand(MoveSelectionDown);
         ActivateSelectedCommand = new RelayCommand(ActivateSelected);
 
+        _searchDebounceTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(SearchDebounceMs)
+        };
+        _searchDebounceTimer.Tick += SearchDebounceTimer_Tick;
+
         SettingsService.Instance.SettingsChanged += OnSettingsChanged;
+    }
+
+    private void SearchDebounceTimer_Tick(object? sender, EventArgs e)
+    {
+        _searchDebounceTimer.Stop();
+        FilterWindows();
     }
 
     private void OnSettingsChanged(object? sender, EventArgs e) => OnPropertyChanged(nameof(ShowMonitorInfo));
@@ -44,6 +78,8 @@ public class MainViewModel : ObservableObject, IDisposable
     public void Dispose()
     {
         SettingsService.Instance.SettingsChanged -= OnSettingsChanged;
+        _searchDebounceTimer.Stop();
+        _searchDebounceTimer.Tick -= SearchDebounceTimer_Tick;
     }
 
     public string SearchText
@@ -55,7 +91,10 @@ public class MainViewModel : ObservableObject, IDisposable
             {
                 _searchText = value;
                 OnPropertyChanged();
-                FilterWindows();
+
+                // Coalesce rapid keystrokes into a single filter pass.
+                _searchDebounceTimer.Stop();
+                _searchDebounceTimer.Start();
             }
         }
     }
@@ -69,12 +108,12 @@ public class MainViewModel : ObservableObject, IDisposable
             {
                 if (_selectedWindow != null)
                     _selectedWindow.IsSelected = false;
-                
+
                 _selectedWindow = value;
-                
+
                 if (_selectedWindow != null)
                     _selectedWindow.IsSelected = true;
-                
+
                 OnPropertyChanged();
             }
         }
@@ -102,31 +141,48 @@ public class MainViewModel : ObservableObject, IDisposable
 
     public event EventHandler? WindowActivated;
 
-    private void UpdateFilteredWindows(System.Collections.Generic.List<AppWindow> newList)
+    /// <summary>
+    /// Update <see cref="_filteredWindows"/> in place with minimal collection-changed notifications.
+    /// </summary>
+    /// <remarks>
+    /// Strategy:
+    /// <list type="number">
+    ///   <item>Common case: items are mostly the same — perform an index-by-index Replace where
+    ///         differences appear. Replace fires a single Replace notification (not Remove+Insert)
+    ///         and ListBox handles it efficiently with virtualization.</item>
+    ///   <item>If the size differs significantly, fall back to Clear + add-back, which is one
+    ///         Reset notification — cheaper than dozens of incremental notifications.</item>
+    /// </list>
+    /// </remarks>
+    private void UpdateFilteredWindows(IReadOnlyList<AppWindow> newList)
     {
-        var newSet = new System.Collections.Generic.HashSet<AppWindow>(newList);
+        int oldCount = _filteredWindows.Count;
+        int newCount = newList.Count;
 
-        for (int i = _filteredWindows.Count - 1; i >= 0; i--)
+        // Big delta — Reset is the cheapest single notification.
+        if (oldCount == 0 || newCount == 0 || Math.Abs(oldCount - newCount) > newCount / 2 + 4)
         {
-            if (!newSet.Contains(_filteredWindows[i]))
-                _filteredWindows.RemoveAt(i);
-        }
-        for (int i = 0; i < newList.Count; i++)
-        {
-            if (i >= _filteredWindows.Count)
-            {
+            _filteredWindows.Clear();
+            for (int i = 0; i < newCount; i++)
                 _filteredWindows.Add(newList[i]);
-            }
-            else if (_filteredWindows[i] != newList[i])
-            {
-                _filteredWindows.Insert(i, newList[i]);
-                int oldIdx = i + 1;
-                if (oldIdx < _filteredWindows.Count && !newSet.Contains(_filteredWindows[oldIdx]))
-                    _filteredWindows.RemoveAt(oldIdx);
-            }
+            return;
         }
-        while (_filteredWindows.Count > newList.Count)
+
+        // Trim excess.
+        while (_filteredWindows.Count > newCount)
             _filteredWindows.RemoveAt(_filteredWindows.Count - 1);
+
+        // Replace mismatches in place.
+        int common = Math.Min(_filteredWindows.Count, newCount);
+        for (int i = 0; i < common; i++)
+        {
+            if (!ReferenceEquals(_filteredWindows[i], newList[i]))
+                _filteredWindows[i] = newList[i];
+        }
+
+        // Append new tail.
+        for (int i = _filteredWindows.Count; i < newCount; i++)
+            _filteredWindows.Add(newList[i]);
     }
 
     private void NotifyWindowCountChanged()
@@ -163,20 +219,25 @@ public class MainViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Refresh the window list
+    /// Refresh the window list.
     /// </summary>
-    /// <param name="selectSecondWindow">If true, select the second window (Alt+Tab behavior)</param>
+    /// <param name="selectSecondWindow">If true, select the second window (Alt+Tab behavior).</param>
     public void RefreshWindows(bool selectSecondWindow = false)
     {
-        var windows = _windowService.GetWindows();
-        _windows = new ObservableCollection<AppWindow>(windows);
+        // Cancel any pending debounced filter — we're refreshing now.
+        _searchDebounceTimer.Stop();
 
-        // If in grouped mode, maintain the grouping state
+        _windows = _windowService.GetWindows();
+
+        // If in grouped mode, maintain the grouping state.
         if (_isGroupedByProcess && _groupedProcessName != null)
         {
-            var groupedWindows = _windows
-                .Where(w => w.ProcessName == _groupedProcessName)
-                .ToList();
+            var groupedWindows = new List<AppWindow>();
+            for (int i = 0; i < _windows.Count; i++)
+            {
+                if (_windows[i].ProcessName == _groupedProcessName)
+                    groupedWindows.Add(_windows[i]);
+            }
 
             UpdateFilteredWindows(groupedWindows);
             NotifyWindowCountChanged();
@@ -204,9 +265,20 @@ public class MainViewModel : ObservableObject, IDisposable
 
     private void FilterWindows(bool selectSecondWindow)
     {
-        var filtered = string.IsNullOrWhiteSpace(SearchText)
-            ? _windows.ToList()
-            : _windows.Where(w => w.MatchesFilter(SearchText)).ToList();
+        List<AppWindow> filtered;
+        if (string.IsNullOrWhiteSpace(SearchText))
+        {
+            filtered = new List<AppWindow>(_windows);
+        }
+        else
+        {
+            filtered = new List<AppWindow>(_windows.Count);
+            for (int i = 0; i < _windows.Count; i++)
+            {
+                if (_windows[i].MatchesFilter(SearchText))
+                    filtered.Add(_windows[i]);
+            }
+        }
 
         UpdateFilteredWindows(filtered);
         NotifyWindowCountChanged();
@@ -226,8 +298,8 @@ public class MainViewModel : ObservableObject, IDisposable
     {
         if (FilteredWindows.Count == 0) return;
 
-        var currentIndex = SelectedWindow != null 
-            ? FilteredWindows.IndexOf(SelectedWindow) 
+        var currentIndex = SelectedWindow != null
+            ? FilteredWindows.IndexOf(SelectedWindow)
             : 0;
 
         var newIndex = currentIndex > 0 ? currentIndex - 1 : FilteredWindows.Count - 1;
@@ -238,8 +310,8 @@ public class MainViewModel : ObservableObject, IDisposable
     {
         if (FilteredWindows.Count == 0) return;
 
-        var currentIndex = SelectedWindow != null 
-            ? FilteredWindows.IndexOf(SelectedWindow) 
+        var currentIndex = SelectedWindow != null
+            ? FilteredWindows.IndexOf(SelectedWindow)
             : -1;
 
         var newIndex = currentIndex < FilteredWindows.Count - 1 ? currentIndex + 1 : 0;
@@ -255,16 +327,16 @@ public class MainViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Close the selected window and refresh the list
+    /// Close the selected window and refresh the list.
     /// </summary>
-    /// <returns>true if closed successfully, false if the window is elevated and we're not admin</returns>
+    /// <returns>true if closed successfully, false if the window is elevated and we're not admin.</returns>
     public bool CloseSelectedWindow()
     {
         if (SelectedWindow == null) return true;
 
         var windowToClose = SelectedWindow;
 
-        // Check if admin privileges are required
+        // Check if admin privileges are required.
         if (windowToClose.IsElevated && !Services.AdminService.IsRunningAsAdmin())
         {
             return false;
@@ -272,7 +344,6 @@ public class MainViewModel : ObservableObject, IDisposable
 
         var currentIndex = FilteredWindows.IndexOf(windowToClose);
 
-        // Close the window
         windowToClose.Close();
 
         _windows.Remove(windowToClose);
@@ -283,7 +354,7 @@ public class MainViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Kill the process of the currently selected window
+    /// Kill the process of the currently selected window.
     /// </summary>
     public void StopSelectedProcess()
     {
@@ -299,18 +370,19 @@ public class MainViewModel : ObservableObject, IDisposable
         }
         catch
         {
-            // Return immediately if the process cannot be terminated
             return;
         }
 
-        var windowsToRemove = _windows
-            .Where(w => w.ProcessId == targetProcessId)
-            .ToList();
-
-        foreach (var window in windowsToRemove)
+        // Remove all windows belonging to the killed process.
+        for (int i = _windows.Count - 1; i >= 0; i--)
         {
-            _windows.Remove(window);
-            FilteredWindows.Remove(window);
+            if (_windows[i].ProcessId == targetProcessId)
+                _windows.RemoveAt(i);
+        }
+        for (int i = FilteredWindows.Count - 1; i >= 0; i--)
+        {
+            if (FilteredWindows[i].ProcessId == targetProcessId)
+                FilteredWindows.RemoveAt(i);
         }
 
         NotifyWindowCountChanged();
@@ -327,26 +399,34 @@ public class MainViewModel : ObservableObject, IDisposable
 
     public void ClearSearch()
     {
-        SearchText = string.Empty;
+        // Stop debounce timer — we're clearing synchronously.
+        _searchDebounceTimer.Stop();
+        if (_searchText != string.Empty)
+        {
+            _searchText = string.Empty;
+            OnPropertyChanged(nameof(SearchText));
+            // Don't call FilterWindows here — RefreshWindows will do it.
+        }
     }
 
     /// <summary>
-    /// Group windows by the process of the currently selected window (Right arrow key)
+    /// Group windows by the process of the currently selected window (Right arrow key).
     /// </summary>
     public void GroupByProcess()
     {
         if (SelectedWindow == null || FilteredWindows.Count == 0)
             return;
 
-        // Save current state
         _lastSelectedWindowBeforeGrouping = SelectedWindow;
         _groupedProcessName = SelectedWindow.ProcessName;
         _isGroupedByProcess = true;
 
-        // Filter windows belonging to the same process
-        var groupedWindows = FilteredWindows
-            .Where(w => w.ProcessName == _groupedProcessName)
-            .ToList();
+        var groupedWindows = new List<AppWindow>();
+        for (int i = 0; i < FilteredWindows.Count; i++)
+        {
+            if (FilteredWindows[i].ProcessName == _groupedProcessName)
+                groupedWindows.Add(FilteredWindows[i]);
+        }
 
         UpdateFilteredWindows(groupedWindows);
         NotifyWindowCountChanged();
@@ -358,7 +438,7 @@ public class MainViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Return to the full list and navigate to the previously selected process (Left arrow key)
+    /// Return to the full list and navigate to the previously selected process (Left arrow key).
     /// </summary>
     public void UngroupFromProcess()
     {
@@ -369,22 +449,18 @@ public class MainViewModel : ObservableObject, IDisposable
         var processNameToFind = _groupedProcessName;
         _groupedProcessName = null;
 
-        // Re-filter windows (restore full list)
         FilterWindows();
 
-        // Try to navigate to the previously selected process
         if (processNameToFind != null && FilteredWindows.Count > 0)
         {
-            // Find the first window matching that process
             var targetWindow = FilteredWindows.FirstOrDefault(w => w.ProcessName == processNameToFind);
-            
+
             if (targetWindow != null)
             {
                 SelectedWindow = targetWindow;
             }
             else
             {
-                // If all windows of that process are closed, select the first window
                 SelectedWindow = FilteredWindows[0];
             }
         }
@@ -397,7 +473,7 @@ public class MainViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Reset grouping state (called after window activation)
+    /// Reset grouping state (called after window activation).
     /// </summary>
     public void ResetGrouping()
     {
@@ -406,6 +482,4 @@ public class MainViewModel : ObservableObject, IDisposable
             ExitGroupingMode();
         }
     }
-
 }
-

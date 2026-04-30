@@ -79,9 +79,13 @@ public partial class App : Application
             }
         }
 
-        // Update startup registration to ensure it matches current admin state
-        // This is needed because creating admin startup task requires admin privileges
-        StartupService.UpdateStartupRegistration();
+        // Update startup registration to ensure it matches current admin state.
+        // Done off the UI/startup thread because admin startup uses Task Scheduler (schtasks
+        // child process, up to several seconds). Cold start should never block on this.
+        if (settings.StartWithWindows)
+        {
+            _ = Task.Run(StartupService.UpdateStartupRegistration);
+        }
 
         // Initialize language service
         LanguageService.Instance.Initialize();

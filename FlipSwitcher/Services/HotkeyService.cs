@@ -342,37 +342,56 @@ public class HotkeyService : IDisposable
 
     private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
     {
-        if (nCode >= 0 && _useAltTab)
+        // Hot path: this runs for every keystroke system-wide. Be paranoid about cost.
+        if (nCode < 0 || !_useAltTab)
+            return NativeMethods.CallNextHookEx(_keyboardHookId, nCode, wParam, lParam);
+
+        long msg = wParam.ToInt64();
+        bool isKeyDown = msg == NativeMethods.WM_KEYDOWN || msg == NativeMethods.WM_SYSKEYDOWN;
+        bool isKeyUp = msg == NativeMethods.WM_KEYUP || msg == NativeMethods.WM_SYSKEYUP;
+
+        // Neither down nor up — don't bother decoding the struct.
+        if (!isKeyDown && !isKeyUp)
+            return NativeMethods.CallNextHookEx(_keyboardHookId, nCode, wParam, lParam);
+
+        // KBDLLHOOKSTRUCT layout: vkCode is the first field (UInt32 at offset 0).
+        // Reading it directly via unsafe pointer avoids the cost of full Marshal.PtrToStructure
+        // (allocation, field-by-field unmarshaling) on every keystroke. We never need the other
+        // fields in this hook.
+        uint vkCode;
+        unsafe
         {
-            var hookStruct = Marshal.PtrToStructure<NativeMethods.KBDLLHOOKSTRUCT>(lParam);
-            long msg = wParam.ToInt64();
-            bool isKeyDown = msg == NativeMethods.WM_KEYDOWN || msg == NativeMethods.WM_SYSKEYDOWN;
-            bool isKeyUp = msg == NativeMethods.WM_KEYUP || msg == NativeMethods.WM_SYSKEYUP;
-
-            if (HandleEscapeKey(isKeyDown, hookStruct.vkCode))
-                return (IntPtr)1;
-
-            HandleAltRelease(isKeyUp, hookStruct.vkCode);
-
-            if (IsAltPressed() && isKeyDown)
-            {
-                // Tab key - show/navigate
-                if (hookStruct.vkCode == NativeMethods.VK_TAB)
-                {
-                    if (!_isVisible)
-                        InvokeOnDispatcher(() => HotkeyPressed?.Invoke(this, EventArgs.Empty));
-                    else
-                    {
-                        var direction = IsShiftPressed() ? NavigationDirection.Previous : NavigationDirection.Next;
-                        InvokeOnDispatcher(() => NavigationRequested?.Invoke(this, new NavigationEventArgs(direction)));
-                    }
-                    return (IntPtr)1;
-                }
-
-                if (HandleNavigationKeys(hookStruct.vkCode) || HandleVisibleShortcuts(hookStruct.vkCode))
-                    return (IntPtr)1;
-            }
+            vkCode = *(uint*)lParam;
         }
+
+        if (HandleEscapeKey(isKeyDown, vkCode))
+            return (IntPtr)1;
+
+        if (isKeyUp)
+        {
+            HandleAltRelease(true, vkCode);
+            return NativeMethods.CallNextHookEx(_keyboardHookId, nCode, wParam, lParam);
+        }
+
+        // From here on, isKeyDown == true. Only act when Alt is held.
+        if (!IsAltPressed())
+            return NativeMethods.CallNextHookEx(_keyboardHookId, nCode, wParam, lParam);
+
+        // Tab key — show/navigate.
+        if (vkCode == NativeMethods.VK_TAB)
+        {
+            if (!_isVisible)
+                InvokeOnDispatcher(() => HotkeyPressed?.Invoke(this, EventArgs.Empty));
+            else
+            {
+                var direction = IsShiftPressed() ? NavigationDirection.Previous : NavigationDirection.Next;
+                InvokeOnDispatcher(() => NavigationRequested?.Invoke(this, new NavigationEventArgs(direction)));
+            }
+            return (IntPtr)1;
+        }
+
+        if (HandleNavigationKeys(vkCode) || HandleVisibleShortcuts(vkCode))
+            return (IntPtr)1;
 
         return NativeMethods.CallNextHookEx(_keyboardHookId, nCode, wParam, lParam);
     }

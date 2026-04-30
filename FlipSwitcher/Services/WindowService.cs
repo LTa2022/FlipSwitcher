@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using FlipSwitcher.Core;
@@ -9,8 +8,22 @@ using FlipSwitcher.Models;
 namespace FlipSwitcher.Services;
 
 /// <summary>
-/// Service for enumerating and managing windows
+/// Service for enumerating and managing windows.
 /// </summary>
+/// <remarks>
+/// Performance notes (rev 2):
+/// <list type="bullet">
+///   <item>Process-name and elevation caches live for the lifetime of the service so
+///         repeatedly opening the switcher doesn't re-query the same processes.</item>
+///   <item>Filters are ordered cheap-first: visibility, cloak and style flags short-circuit
+///         before any string allocation or process query.</item>
+///   <item>Per-call delegates for <c>EnumWindows</c> / <c>EnumDisplayMonitors</c> are now
+///         instance fields, so we don't allocate a new closure on every refresh.</item>
+///   <item>Existing <see cref="AppWindow"/> instances are reused across refreshes when
+///         the underlying HWND is unchanged. This preserves their async-loaded icon and
+///         their elevation cache.</item>
+/// </list>
+/// </remarks>
 public class WindowService
 {
     private static readonly HashSet<string> ExcludedClassNames = new(StringComparer.OrdinalIgnoreCase)
@@ -23,7 +36,7 @@ public class WindowService
         "MssgrIMWindow",
         "SysShadow",
         "Xaml_WindowedPopupClass",
-        "Windows.UI.Core.CoreWindow" // Core window inside ApplicationFrameWindow
+        "Windows.UI.Core.CoreWindow"
     };
 
     private static readonly HashSet<string> ExcludedProcessNames = new(StringComparer.OrdinalIgnoreCase)
@@ -41,46 +54,50 @@ public class WindowService
 
     private record struct WindowInfo(string Title, string ClassName, uint ProcessId, string ProcessName);
 
+    // Long-lived caches reused across GetWindows() calls.
+    private readonly Dictionary<uint, string> _processNameCache = new();
+    private readonly Dictionary<uint, bool> _elevationCache = new();
+    private readonly Dictionary<IntPtr, AppWindow> _windowInstanceCache = new();
+
+    // Reused buffers / collections — avoids per-call allocation in the hot path.
+    private readonly StringBuilder _titleBuilder = new(256);
+    private readonly StringBuilder _classBuilder = new(MaxClassNameLength);
+    private readonly List<IntPtr> _monitors = new();
+    private readonly List<NativeMethods.RECT> _monitorRects = new();
+    private readonly List<AppWindow> _windowsScratch = new();
+    private readonly HashSet<IntPtr> _seenHandles = new();
+    private readonly HashSet<uint> _seenProcessIds = new();
+
+    // Stable delegate instances — Win32 callbacks pin these via the lifetime of the service.
+    private readonly NativeMethods.MonitorEnumProc _monitorEnumProc;
+    private readonly NativeMethods.EnumWindowsProc _enumWindowsProc;
+
+    // Per-enumeration state passed to the Win32 callbacks. Set inside GetWindows() before EnumWindows().
+    private IntPtr _shellWindow;
+    private uint _currentProcessId;
+
+    public WindowService()
+    {
+        _monitorEnumProc = MonitorEnumCallback;
+        _enumWindowsProc = EnumWindowsCallback;
+    }
+
     /// <summary>
-    /// Returns true when a layered window is invisible to the user and should be excluded
-    /// from the switcher, covering three cases that share the same "user cannot see this" property:
-    /// <list type="bullet">
-    ///   <item><description>
-    ///     <c>flags == 0</c> — <c>WS_EX_LAYERED</c> was set but <c>SetLayeredWindowAttributes</c> was
-    ///     never called. Win32 renders such a window as fully transparent by default. This is the
-    ///     pattern used by tray-only helper processes that create an HWND purely as a message-loop
-    ///     anchor (e.g. Bluetooth tray daemons, audio endpoint helpers).
-    ///   </description></item>
-    ///   <item><description>
-    ///     <c>LWA_ALPHA</c> with <c>alpha == 0</c> — explicitly blended to fully transparent.
-    ///   </description></item>
-    ///   <item><description>
-    ///     <c>LWA_COLORKEY</c> without <c>LWA_ALPHA</c> — the entire client area is punched out by a
-    ///     chroma key; there is no visible pixel content for the user to interact with.
-    ///   </description></item>
-    /// </list>
-    /// Note: if <c>GetLayeredWindowAttributes</c> fails the window uses <c>UpdateLayeredWindow</c>
-    /// (e.g. WPF <c>AllowsTransparency</c>) and may be genuinely visible — leave those alone.
+    /// Returns true when a layered window is invisible to the user. See AppWindow rev1 for the
+    /// full case discussion (transparent tray-only helper anchors, alpha=0, color-key only).
     /// </summary>
     private static bool IsFullyTransparentLayered(IntPtr hWnd, long exStyle)
     {
         if ((exStyle & NativeMethods.WS_EX_LAYERED) == 0)
             return false;
 
-        // Failure means the window drives its own compositing via UpdateLayeredWindow – not a ghost.
         if (!NativeMethods.GetLayeredWindowAttributes(hWnd, out _, out byte alpha, out uint flags))
             return false;
 
-        // flags == 0: WS_EX_LAYERED set but SetLayeredWindowAttributes never called →
-        // Win32 default is fully transparent; typical message-loop anchor pattern for tray daemons.
         if (flags == 0)
             return true;
-
-        // Explicitly blended to fully transparent.
         if ((flags & NativeMethods.LWA_ALPHA) != 0 && alpha == 0)
             return true;
-
-        // Color-key only (no alpha channel): entire surface is chroma-keyed out, nothing visible.
         if ((flags & NativeMethods.LWA_ALPHA) == 0 && (flags & NativeMethods.LWA_COLORKEY) != 0)
             return true;
 
@@ -90,92 +107,102 @@ public class WindowService
     private static bool RectanglesIntersect(NativeMethods.RECT a, NativeMethods.RECT b) =>
         a.Left < b.Right && a.Right > b.Left && a.Top < b.Bottom && a.Bottom > b.Top;
 
-    private static bool WindowIntersectsAnyMonitor(NativeMethods.RECT windowRect, IReadOnlyList<NativeMethods.RECT> monitorRects)
+    private bool WindowIntersectsAnyMonitor(NativeMethods.RECT windowRect)
     {
-        foreach (var m in monitorRects)
+        for (int i = 0; i < _monitorRects.Count; i++)
         {
-            if (RectanglesIntersect(windowRect, m))
+            if (RectanglesIntersect(windowRect, _monitorRects[i]))
                 return true;
         }
         return false;
     }
 
-    private static WindowInfo? TryGetWindowInfo(IntPtr hWnd, IntPtr shellWindow, uint currentProcessId,
-        Dictionary<uint, string> processNameCache, IReadOnlyList<NativeMethods.RECT> monitorRects)
+    /// <summary>
+    /// Cheap, no-allocation predicate run before any string read or process query.
+    /// </summary>
+    private bool PassesCheapFilters(IntPtr hWnd)
     {
-        if (hWnd == shellWindow || !NativeMethods.IsWindowVisible(hWnd))
-            return null;
-
+        if (hWnd == _shellWindow || !NativeMethods.IsWindowVisible(hWnd))
+            return false;
         if (IsCloaked(hWnd))
-            return null;
+            return false;
 
         var exStyle = (long)NativeMethods.GetWindowLongPtr(hWnd, NativeMethods.GWL_EXSTYLE);
 
-        // Tray / ghost hosts: still "visible" to the API but alpha is fully transparent
         if (IsFullyTransparentLayered(hWnd, exStyle))
-            return null;
+            return false;
 
-        if ((exStyle & NativeMethods.WS_EX_TOOLWINDOW) != 0 &&
-            (exStyle & NativeMethods.WS_EX_APPWINDOW) == 0)
-            return null;
+        bool isAppWindow = (exStyle & NativeMethods.WS_EX_APPWINDOW) != 0;
 
-        // Filter windows with WS_EX_NOACTIVATE (non-activatable windows should not appear in task switcher)
-        if ((exStyle & NativeMethods.WS_EX_NOACTIVATE) != 0 &&
-            (exStyle & NativeMethods.WS_EX_APPWINDOW) == 0)
-            return null;
+        if ((exStyle & NativeMethods.WS_EX_TOOLWINDOW) != 0 && !isAppWindow)
+            return false;
 
-        // Filter windows that are too small (skip check for minimized windows)
-        if (!NativeMethods.IsIconic(hWnd) && !HasValidWindowSize(hWnd))
-            return null;
+        if ((exStyle & NativeMethods.WS_EX_NOACTIVATE) != 0 && !isAppWindow)
+            return false;
 
-        // Drop top-level windows parked entirely outside physical monitors (common tray app pattern)
-        if (!NativeMethods.IsIconic(hWnd) && monitorRects.Count > 0 &&
+        bool isIconic = NativeMethods.IsIconic(hWnd);
+
+        if (!isIconic && !HasValidWindowSize(hWnd))
+            return false;
+
+        if (!isIconic && _monitorRects.Count > 0 &&
             NativeMethods.GetWindowRect(hWnd, out var windowRect) &&
-            !WindowIntersectsAnyMonitor(windowRect, monitorRects))
-            return null;
+            !WindowIntersectsAnyMonitor(windowRect))
+            return false;
 
-        NativeMethods.GetWindowThreadProcessId(hWnd, out uint processId);
-        if (processId == currentProcessId)
-            return null;
-
+        // Ownership chain.
         var owner = NativeMethods.GetWindow(hWnd, NativeMethods.GW_OWNER);
-        if (owner != IntPtr.Zero && (exStyle & NativeMethods.WS_EX_APPWINDOW) == 0)
+        if (owner != IntPtr.Zero && !isAppWindow)
         {
-            // Walk the owner chain: if any owner in the chain is visible, this window is a
-            // subordinate dialog (e.g. Environment Variables owned by System Properties) and
-            // should be hidden. If all owners are invisible (e.g. a hidden launcher window),
-            // the window itself is the "top" of the visible chain and should be shown.
             var current = owner;
             while (current != IntPtr.Zero)
             {
                 if (NativeMethods.IsWindowVisible(current))
-                    return null;
+                    return false;
                 current = NativeMethods.GetWindow(current, NativeMethods.GW_OWNER);
             }
         }
 
+        return true;
+    }
+
+    private WindowInfo? TryGetWindowInfo(IntPtr hWnd)
+    {
+        if (!PassesCheapFilters(hWnd))
+            return null;
+
+        // Title pulled before process query — windows with no title are noise (e.g. invisible
+        // tooltip helpers with no caption) and we can drop them without paying for OpenProcess.
         var titleLength = NativeMethods.GetWindowTextLength(hWnd);
         if (titleLength == 0)
             return null;
 
-        var titleBuilder = new StringBuilder(titleLength + 1);
-        NativeMethods.GetWindowText(hWnd, titleBuilder, titleBuilder.Capacity);
-        var title = titleBuilder.ToString();
-        if (string.IsNullOrWhiteSpace(title))
-            return null;
-
-        var classBuilder = new StringBuilder(MaxClassNameLength);
-        NativeMethods.GetClassName(hWnd, classBuilder, classBuilder.Capacity);
-        var className = classBuilder.ToString();
+        // Class name short-circuits known UI shells before process query.
+        _classBuilder.Clear();
+        _classBuilder.EnsureCapacity(MaxClassNameLength);
+        NativeMethods.GetClassName(hWnd, _classBuilder, _classBuilder.Capacity);
+        var className = _classBuilder.ToString();
         if (ExcludedClassNames.Contains(className))
             return null;
 
-        if (!processNameCache.TryGetValue(processId, out var processName))
+        NativeMethods.GetWindowThreadProcessId(hWnd, out uint processId);
+        if (processId == _currentProcessId)
+            return null;
+
+        if (!_processNameCache.TryGetValue(processId, out var processName))
         {
             processName = GetProcessName(processId);
-            processNameCache[processId] = processName;
+            _processNameCache[processId] = processName;
         }
         if (ExcludedProcessNames.Contains(processName))
+            return null;
+
+        // Now read the title (cheapest done after we know we'll keep the window).
+        _titleBuilder.Clear();
+        _titleBuilder.EnsureCapacity(titleLength + 1);
+        NativeMethods.GetWindowText(hWnd, _titleBuilder, _titleBuilder.Capacity);
+        var title = _titleBuilder.ToString();
+        if (string.IsNullOrWhiteSpace(title))
             return null;
 
         return new WindowInfo(title, className, processId, processName);
@@ -199,50 +226,116 @@ public class WindowService
         return (isMinimized, isMaximized);
     }
 
+    private bool MonitorEnumCallback(IntPtr hMon, IntPtr hdc, ref NativeMethods.RECT rect, IntPtr data)
+    {
+        _monitors.Add(hMon);
+        var mi = new NativeMethods.MONITORINFO { cbSize = Marshal.SizeOf<NativeMethods.MONITORINFO>() };
+        if (NativeMethods.GetMonitorInfo(hMon, ref mi))
+            _monitorRects.Add(mi.rcMonitor);
+        else
+            _monitorRects.Add(rect);
+        return true;
+    }
+
+    private bool EnumWindowsCallback(IntPtr hWnd, IntPtr lParam)
+    {
+        try
+        {
+            var info = TryGetWindowInfo(hWnd);
+            if (info is null)
+                return true;
+
+            _seenHandles.Add(hWnd);
+            _seenProcessIds.Add(info.Value.ProcessId);
+
+            // Reuse existing AppWindow instance if title/state hasn't changed.
+            // This preserves the async-loaded Icon and avoids triggering UI rebinds.
+            if (_windowInstanceCache.TryGetValue(hWnd, out var existing) &&
+                existing.Title == info.Value.Title &&
+                existing.ProcessName == info.Value.ProcessName)
+            {
+                var (existingMin, existingMax) = (existing.IsMinimized, existing.IsMaximized);
+                var (curMin, curMax) = GetWindowState(hWnd);
+                if (existingMin == curMin && existingMax == curMax)
+                {
+                    _windowsScratch.Add(existing);
+                    return true;
+                }
+            }
+
+            var (isMinimized, isMaximized) = GetWindowState(hWnd);
+            var window = new AppWindow(hWnd, info.Value.Title, info.Value.ClassName,
+                info.Value.ProcessId, info.Value.ProcessName, isMinimized, isMaximized,
+                _monitors, _elevationCache);
+
+            // Pre-populate icon synchronously if the global cache already knows it — avoids
+            // the brief "icon flashes in" effect on subsequent activations.
+            var exePath = IconCacheService.Instance.GetProcessPath(info.Value.ProcessId);
+            if (!string.IsNullOrEmpty(exePath) &&
+                IconCacheService.Instance.TryGetExeIcon(exePath, out var cachedIcon) &&
+                cachedIcon != null)
+            {
+                window.TrySetCachedIcon(cachedIcon);
+            }
+
+            _windowInstanceCache[hWnd] = window;
+            _windowsScratch.Add(window);
+        }
+        catch
+        {
+            // Skip windows that cause errors.
+        }
+
+        return true;
+    }
+
     public List<AppWindow> GetWindows()
     {
-        var windows = new List<AppWindow>();
-        var shellWindow = NativeMethods.GetShellWindow();
-        var currentProcessId = (uint)Environment.ProcessId;
-        var processNameCache = new Dictionary<uint, string>();
-        var elevationCache = new Dictionary<uint, bool>();
+        _shellWindow = NativeMethods.GetShellWindow();
+        _currentProcessId = (uint)Environment.ProcessId;
 
-        var monitors = new List<IntPtr>();
-        var monitorRects = new List<NativeMethods.RECT>();
-        NativeMethods.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero,
-            (IntPtr hMon, IntPtr hdc, ref NativeMethods.RECT rect, IntPtr data) =>
-            {
-                monitors.Add(hMon);
-                var mi = new NativeMethods.MONITORINFO { cbSize = Marshal.SizeOf<NativeMethods.MONITORINFO>() };
-                if (NativeMethods.GetMonitorInfo(hMon, ref mi))
-                    monitorRects.Add(mi.rcMonitor);
-                else
-                    monitorRects.Add(rect);
-                return true;
-            }, IntPtr.Zero);
+        _monitors.Clear();
+        _monitorRects.Clear();
+        _windowsScratch.Clear();
+        _seenHandles.Clear();
+        _seenProcessIds.Clear();
 
-        NativeMethods.EnumWindows((hWnd, lParam) =>
+        NativeMethods.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, _monitorEnumProc, IntPtr.Zero);
+        NativeMethods.EnumWindows(_enumWindowsProc, IntPtr.Zero);
+
+        // Drop instance-cache entries for windows that no longer exist (closed since last call).
+        if (_windowInstanceCache.Count > _seenHandles.Count)
         {
-            try
+            var stale = new List<IntPtr>(_windowInstanceCache.Count - _seenHandles.Count);
+            foreach (var key in _windowInstanceCache.Keys)
             {
-                var info = TryGetWindowInfo(hWnd, shellWindow, currentProcessId, processNameCache, monitorRects);
-                if (info is null)
-                    return true;
-
-                var (isMinimized, isMaximized) = GetWindowState(hWnd);
-                var window = new AppWindow(hWnd, info.Value.Title, info.Value.ClassName,
-                    info.Value.ProcessId, info.Value.ProcessName, isMinimized, isMaximized, monitors, elevationCache);
-                windows.Add(window);
+                if (!_seenHandles.Contains(key))
+                    stale.Add(key);
             }
-            catch
+            foreach (var key in stale)
+                _windowInstanceCache.Remove(key);
+        }
+
+        // Drop process-name / elevation entries for processes that no longer have any visible window.
+        // Keeps the caches bounded across long sessions.
+        if (_processNameCache.Count > _seenProcessIds.Count * 2)
+        {
+            var staleP = new List<uint>();
+            foreach (var pid in _processNameCache.Keys)
             {
-                // Skip windows that cause errors
+                if (!_seenProcessIds.Contains(pid))
+                    staleP.Add(pid);
             }
+            foreach (var pid in staleP)
+            {
+                _processNameCache.Remove(pid);
+                _elevationCache.Remove(pid);
+            }
+            IconCacheService.Instance.TrimProcessCache(_seenProcessIds);
+        }
 
-            return true;
-        }, IntPtr.Zero);
-
-        return windows;
+        // Return a copy so callers can mutate freely without disturbing our scratch buffer.
+        return new List<AppWindow>(_windowsScratch);
     }
 
     private static bool IsCloaked(IntPtr hWnd)
@@ -259,7 +352,7 @@ public class WindowService
         }
     }
 
-    private const int MinWindowSize = 50; // Minimum window size threshold (both dimensions)
+    private const int MinWindowSize = 50;
     /// <summary>
     /// When a window is collapsed to a title-bar strip (abnormal layout / user resize),
     /// <see cref="NativeMethods.GetWindowRect"/> height is often ~30–45px, below <see cref="MinWindowSize"/>.

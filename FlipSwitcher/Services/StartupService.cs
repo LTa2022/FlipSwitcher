@@ -249,15 +249,28 @@ public static class StartupService
     }
 
     /// <summary>
-    /// Update the startup registration based on current settings
+    /// Update the startup registration based on current settings.
+    /// Only writes if the actual on-disk registration differs from settings, to avoid
+    /// re-creating the registry entry / scheduled task on every cold start.
     /// </summary>
     public static void UpdateStartupRegistration()
     {
         var settings = SettingsService.Instance.Settings;
-        if (settings.StartWithWindows)
-        {
-            SetStartupEnabled(true);
-        }
+        if (!settings.StartWithWindows)
+            return;
+
+        // If we're already registered correctly, skip — `SetStartupEnabled(true)` would otherwise
+        // delete and re-create the schtasks entry every cold start.
+        bool registryHasUs = IsInRegistry();
+        bool taskSchedulerHasUs = IsInTaskScheduler();
+
+        bool desiredRegistry = !settings.RunAsAdmin;
+        bool desiredTaskScheduler = settings.RunAsAdmin;
+
+        if (registryHasUs == desiredRegistry && taskSchedulerHasUs == desiredTaskScheduler)
+            return;
+
+        SetStartupEnabled(true);
     }
 
 }
