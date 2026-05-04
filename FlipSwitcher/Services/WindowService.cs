@@ -23,6 +23,15 @@ namespace FlipSwitcher.Services;
 ///         the underlying HWND is unchanged. This preserves their async-loaded icon and
 ///         their elevation cache.</item>
 /// </list>
+/// Ordering notes (rev 3):
+/// <list type="bullet">
+///   <item><c>EnumWindows</c> walks Z-order top-to-bottom, and the OS pins every window
+///         carrying <c>WS_EX_TOPMOST</c> ahead of all non-topmost windows. Without
+///         intervention that means a Picture-in-Picture popup, an always-on-top utility,
+///         or a notification balloon would permanently occupy the head of the switcher,
+///         hiding the genuine MRU window. We split topmost windows into a separate bucket
+///         and append them after the normal Z-ordered ones in <see cref="GetWindows"/>.</item>
+/// </list>
 /// </remarks>
 public class WindowService
 {
@@ -52,7 +61,7 @@ public class WindowService
     private const int WPF_RESTORETOMAXIMIZED = 0x2;
     private const int MaxClassNameLength = 256;
 
-    private record struct WindowInfo(string Title, string ClassName, uint ProcessId, string ProcessName);
+    private record struct WindowInfo(string Title, string ClassName, uint ProcessId, string ProcessName, bool IsTopmost);
 
     // Long-lived caches reused across GetWindows() calls.
     private readonly Dictionary<uint, string> _processNameCache = new();
@@ -65,6 +74,11 @@ public class WindowService
     private readonly List<IntPtr> _monitors = new();
     private readonly List<NativeMethods.RECT> _monitorRects = new();
     private readonly List<AppWindow> _windowsScratch = new();
+    // Topmost windows (e.g. browser Picture-in-Picture) are bubbled to the top of Z-order
+    // by the OS regardless of MRU. We collect them separately so they don't displace
+    // genuinely most-recently-used windows from the head of the switcher list. They are
+    // appended after the normal Z-ordered windows in GetWindows().
+    private readonly List<AppWindow> _topmostScratch = new();
     private readonly HashSet<IntPtr> _seenHandles = new();
     private readonly HashSet<uint> _seenProcessIds = new();
 
@@ -119,15 +133,19 @@ public class WindowService
 
     /// <summary>
     /// Cheap, no-allocation predicate run before any string read or process query.
+    /// Returns the queried extended window style via <paramref name="exStyle"/> so callers
+    /// can reuse it (e.g. to test <see cref="NativeMethods.WS_EX_TOPMOST"/>) without a
+    /// second GetWindowLongPtr round-trip.
     /// </summary>
-    private bool PassesCheapFilters(IntPtr hWnd)
+    private bool PassesCheapFilters(IntPtr hWnd, out long exStyle)
     {
+        exStyle = 0;
         if (hWnd == _shellWindow || !NativeMethods.IsWindowVisible(hWnd))
             return false;
         if (IsCloaked(hWnd))
             return false;
 
-        var exStyle = (long)NativeMethods.GetWindowLongPtr(hWnd, NativeMethods.GWL_EXSTYLE);
+        exStyle = (long)NativeMethods.GetWindowLongPtr(hWnd, NativeMethods.GWL_EXSTYLE);
 
         if (IsFullyTransparentLayered(hWnd, exStyle))
             return false;
@@ -168,7 +186,7 @@ public class WindowService
 
     private WindowInfo? TryGetWindowInfo(IntPtr hWnd)
     {
-        if (!PassesCheapFilters(hWnd))
+        if (!PassesCheapFilters(hWnd, out var exStyle))
             return null;
 
         // Title pulled before process query — windows with no title are noise (e.g. invisible
@@ -205,7 +223,13 @@ public class WindowService
         if (string.IsNullOrWhiteSpace(title))
             return null;
 
-        return new WindowInfo(title, className, processId, processName);
+        // WS_EX_TOPMOST windows (browser Picture-in-Picture, always-on-top utilities, etc.)
+        // are forced ahead of all non-topmost windows in the OS Z-order. EnumWindows therefore
+        // returns them first, which would otherwise pin them to the head of our switcher list
+        // and break the MRU illusion. Flag them so GetWindows() can sink them to the bottom.
+        bool isTopmost = (exStyle & NativeMethods.WS_EX_TOPMOST) != 0;
+
+        return new WindowInfo(title, className, processId, processName, isTopmost);
     }
 
     private static (bool isMinimized, bool isMaximized) GetWindowState(IntPtr hWnd)
@@ -248,6 +272,11 @@ public class WindowService
             _seenHandles.Add(hWnd);
             _seenProcessIds.Add(info.Value.ProcessId);
 
+            // Topmost windows are routed to a separate bucket and appended at the tail of
+            // the final list (see GetWindows()). EnumWindows reports them first regardless
+            // of MRU, so leaving them in _windowsScratch would always pin them to position 0.
+            var bucket = info.Value.IsTopmost ? _topmostScratch : _windowsScratch;
+
             // Reuse existing AppWindow instance if title/state hasn't changed.
             // This preserves the async-loaded Icon and avoids triggering UI rebinds.
             if (_windowInstanceCache.TryGetValue(hWnd, out var existing) &&
@@ -258,7 +287,7 @@ public class WindowService
                 var (curMin, curMax) = GetWindowState(hWnd);
                 if (existingMin == curMin && existingMax == curMax)
                 {
-                    _windowsScratch.Add(existing);
+                    bucket.Add(existing);
                     return true;
                 }
             }
@@ -276,7 +305,7 @@ public class WindowService
             // (SHGetFileInfo, ExtractAssociatedIcon, UWP manifest).
 
             _windowInstanceCache[hWnd] = window;
-            _windowsScratch.Add(window);
+            bucket.Add(window);
         }
         catch
         {
@@ -294,6 +323,7 @@ public class WindowService
         _monitors.Clear();
         _monitorRects.Clear();
         _windowsScratch.Clear();
+        _topmostScratch.Clear();
         _seenHandles.Clear();
         _seenProcessIds.Clear();
 
@@ -331,8 +361,13 @@ public class WindowService
             IconCacheService.Instance.TrimProcessCache(_seenProcessIds);
         }
 
-        // Return a copy so callers can mutate freely without disturbing our scratch buffer.
-        return new List<AppWindow>(_windowsScratch);
+        // Compose the final list: normal Z-ordered windows first (preserving MRU semantics),
+        // then topmost windows at the tail. Relative order within each bucket matches the
+        // EnumWindows traversal, so multiple PIP/utility windows keep a stable order.
+        var result = new List<AppWindow>(_windowsScratch.Count + _topmostScratch.Count);
+        result.AddRange(_windowsScratch);
+        result.AddRange(_topmostScratch);
+        return result;
     }
 
     private static bool IsCloaked(IntPtr hWnd)
