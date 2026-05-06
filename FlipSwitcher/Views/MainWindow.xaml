@@ -223,14 +223,32 @@
                                 HorizontalAlignment="Center"
                                 VerticalAlignment="Center" />
                         </Border>
-                        <TextBlock Text="{DynamicResource NoWindowsFound}"
-                            Style="{DynamicResource SubtitleTextStyle}"
-                            Foreground="{DynamicResource TextSecondaryBrush}"
-                            HorizontalAlignment="Center" />
-                        <TextBlock Text="{DynamicResource TryDifferentSearch}"
-                            Style="{DynamicResource CaptionTextStyle}"
-                            HorizontalAlignment="Center"
-                            Margin="0,4,0,0" />
+                        <TextBlock HorizontalAlignment="Center">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock" BasedOn="{StaticResource SubtitleTextStyle}">
+                                    <Setter Property="Foreground" Value="{DynamicResource TextSecondaryBrush}" />
+                                    <Setter Property="Text" Value="{DynamicResource NoVisibleWindows}" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsSearchActive}" Value="True">
+                                            <Setter Property="Text" Value="{DynamicResource NoWindowsFound}" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                        <TextBlock HorizontalAlignment="Center"
+                            Margin="0,4,0,0">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock" BasedOn="{StaticResource CaptionTextStyle}">
+                                    <Setter Property="Text" Value="{DynamicResource WaitingForWindows}" />
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsSearchActive}" Value="True">
+                                            <Setter Property="Text" Value="{DynamicResource TryDifferentSearch}" />
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
                     </StackPanel>
                 </Grid>
             </Border>

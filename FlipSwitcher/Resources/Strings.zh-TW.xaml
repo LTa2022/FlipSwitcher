@@ -10,6 +10,8 @@
     <system:String x:Key="SearchPlaceholder">搜尋視窗...</system:String>
     <system:String x:Key="NoWindowsFound">未找到視窗</system:String>
     <system:String x:Key="TryDifferentSearch">嘗試其他搜尋詞</system:String>
+    <system:String x:Key="NoVisibleWindows">暫無可切換的視窗</system:String>
+    <system:String x:Key="WaitingForWindows">等待視窗出現…</system:String>
     <system:String x:Key="Minimized">已最小化</system:String>
     <system:String x:Key="ElevatedWindow">系統管理員</system:String>
     <system:String x:Key="MonitorPrefix">顯示器 </system:String>

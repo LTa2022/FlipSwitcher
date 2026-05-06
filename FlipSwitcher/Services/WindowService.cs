@@ -61,6 +61,10 @@ public class WindowService
     private const int WPF_RESTORETOMAXIMIZED = 0x2;
     private const int MaxClassNameLength = 256;
 
+    // Locally scoped — only used by the Delphi-VCL compatibility path below. Not promoted to
+    // NativeMethods because the rest of the codebase has no reason to know about it.
+    private const long WS_EX_DLGMODALFRAME = 0x00000001L;
+
     private record struct WindowInfo(string Title, string ClassName, uint ProcessId, string ProcessName, bool IsTopmost);
 
     // Long-lived caches reused across GetWindows() calls.
@@ -176,12 +180,37 @@ public class WindowService
             while (current != IntPtr.Zero)
             {
                 if (NativeMethods.IsWindowVisible(current))
+                {
+                    // Delphi VCL apps (Navicat, EmEditor, older DBeaver builds, etc.) anchor
+                    // every TForm to a hidden TApplication window, which means user-facing
+                    // splash screens, login dialogs and trial nag prompts all appear as owned
+                    // windows with a visible ancestor and would otherwise be silently dropped.
+                    // Treat owned windows that look like real dialogs (have a caption text or
+                    // a dialog frame style) as user-facing and let them through.
+                    if (IsLikelyUserOwnedDialog(hWnd, exStyle))
+                        break;
                     return false;
+                }
                 current = NativeMethods.GetWindow(current, NativeMethods.GW_OWNER);
             }
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Heuristic for "owned but user-facing" windows. Used to bypass the owner-chain check
+    /// for Delphi VCL splash forms / trial dialogs that otherwise look like internal helpers.
+    /// Strict: must either carry a non-empty caption, or have <c>WS_EX_DLGMODALFRAME</c>
+    /// (which Delphi sets on every <c>TForm</c> styled as a dialog). This deliberately rejects
+    /// owned helper forms with no caption and no dialog frame (e.g. Navicat's
+    /// <c>TImageCollection*Form</c>).
+    /// </summary>
+    private static bool IsLikelyUserOwnedDialog(IntPtr hWnd, long exStyle)
+    {
+        if ((exStyle & WS_EX_DLGMODALFRAME) != 0)
+            return true;
+        return NativeMethods.GetWindowTextLength(hWnd) > 0;
     }
 
     private WindowInfo? TryGetWindowInfo(IntPtr hWnd)
@@ -191,8 +220,12 @@ public class WindowService
 
         // Title pulled before process query — windows with no title are noise (e.g. invisible
         // tooltip helpers with no caption) and we can drop them without paying for OpenProcess.
+        // Exception: Delphi VCL trial dialogs (e.g. Navicat's TRegistrationSubForm) sometimes
+        // ship with no caption text but carry WS_EX_DLGMODALFRAME — those are real, user-facing
+        // dialogs and we keep them; AppWindow.FormattedTitle falls back to ProcessName.
         var titleLength = NativeMethods.GetWindowTextLength(hWnd);
-        if (titleLength == 0)
+        bool hasDlgFrame = (exStyle & WS_EX_DLGMODALFRAME) != 0;
+        if (titleLength == 0 && !hasDlgFrame)
             return null;
 
         // Class name short-circuits known UI shells before process query.
@@ -216,12 +249,26 @@ public class WindowService
             return null;
 
         // Now read the title (cheapest done after we know we'll keep the window).
-        _titleBuilder.Clear();
-        _titleBuilder.EnsureCapacity(titleLength + 1);
-        NativeMethods.GetWindowText(hWnd, _titleBuilder, _titleBuilder.Capacity);
-        var title = _titleBuilder.ToString();
-        if (string.IsNullOrWhiteSpace(title))
-            return null;
+        string title;
+        if (titleLength > 0)
+        {
+            _titleBuilder.Clear();
+            _titleBuilder.EnsureCapacity(titleLength + 1);
+            NativeMethods.GetWindowText(hWnd, _titleBuilder, _titleBuilder.Capacity);
+            title = _titleBuilder.ToString();
+            if (string.IsNullOrWhiteSpace(title))
+            {
+                // Whitespace-only titles are still noise unless this is a dialog-frame window —
+                // in which case AppWindow.FormattedTitle will fall back to ProcessName.
+                if (!hasDlgFrame) return null;
+                title = string.Empty;
+            }
+        }
+        else
+        {
+            // Title-less dialog-frame window — display falls back to ProcessName via FormattedTitle.
+            title = string.Empty;
+        }
 
         // WS_EX_TOPMOST windows (browser Picture-in-Picture, always-on-top utilities, etc.)
         // are forced ahead of all non-topmost windows in the OS Z-order. EnumWindows therefore

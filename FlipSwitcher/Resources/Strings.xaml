@@ -10,6 +10,8 @@
     <system:String x:Key="SearchPlaceholder">Type to search windows...</system:String>
     <system:String x:Key="NoWindowsFound">No windows found</system:String>
     <system:String x:Key="TryDifferentSearch">Try a different search term</system:String>
+    <system:String x:Key="NoVisibleWindows">No switchable windows</system:String>
+    <system:String x:Key="WaitingForWindows">Waiting for windows to appear…</system:String>
     <system:String x:Key="Minimized">Minimized</system:String>
     <system:String x:Key="ElevatedWindow">Admin</system:String>
     <system:String x:Key="MonitorPrefix">Monitor </system:String>

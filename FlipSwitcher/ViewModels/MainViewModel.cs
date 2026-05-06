@@ -89,8 +89,11 @@ public class MainViewModel : ObservableObject, IDisposable
         {
             if (_searchText != value)
             {
+                bool wasActive = IsSearchActive;
                 _searchText = value;
                 OnPropertyChanged();
+                if (wasActive != IsSearchActive)
+                    OnPropertyChanged(nameof(IsSearchActive));
 
                 // Coalesce rapid keystrokes into a single filter pass.
                 _searchDebounceTimer.Stop();
@@ -131,7 +134,16 @@ public class MainViewModel : ObservableObject, IDisposable
 
     public int WindowCount => FilteredWindows.Count;
     public bool HasWindows => FilteredWindows.Count > 0;
-    public bool NoWindowsFound => FilteredWindows.Count == 0 && !string.IsNullOrEmpty(SearchText);
+    /// <summary>
+    /// True whenever the list is empty for any reason. The empty-state panel uses this for
+    /// visibility, and switches its caption based on <see cref="IsSearchActive"/> so that
+    /// "no matches for search" and "no switchable windows at all" stay distinguishable.
+    /// (Pre-rev: this used to require <c>!string.IsNullOrEmpty(SearchText)</c>, which left
+    /// the middle of the window blank — neither list nor empty-state — when the OS truly had
+    /// no enumerable windows. That blank gap looked like a hung loading screen.)
+    /// </summary>
+    public bool NoWindowsFound => FilteredWindows.Count == 0;
+    public bool IsSearchActive => !string.IsNullOrEmpty(SearchText);
 
     public ICommand SwitchToWindowCommand { get; }
     public ICommand RefreshWindowsCommand { get; }
@@ -405,6 +417,7 @@ public class MainViewModel : ObservableObject, IDisposable
         {
             _searchText = string.Empty;
             OnPropertyChanged(nameof(SearchText));
+            OnPropertyChanged(nameof(IsSearchActive));
             // Don't call FilterWindows here — RefreshWindows will do it.
         }
     }
