@@ -65,7 +65,7 @@ public class WindowService
     // NativeMethods because the rest of the codebase has no reason to know about it.
     private const long WS_EX_DLGMODALFRAME = 0x00000001L;
 
-    private record struct WindowInfo(string Title, string ClassName, uint ProcessId, string ProcessName, bool IsTopmost);
+    private record struct WindowInfo(string Title, string ClassName, uint ProcessId, string ProcessName, bool IsTopmost, IntPtr OwnerHandle);
 
     // Long-lived caches reused across GetWindows() calls.
     private readonly Dictionary<uint, string> _processNameCache = new();
@@ -85,6 +85,13 @@ public class WindowService
     private readonly List<AppWindow> _topmostScratch = new();
     private readonly HashSet<IntPtr> _seenHandles = new();
     private readonly HashSet<uint> _seenProcessIds = new();
+    // Maps an owned dialog HWND to the visible owner HWND that caused it to be kept via the
+    // Delphi-VCL compatibility path (IsLikelyUserOwnedDialog). After enumeration, GetWindows()
+    // drops any such dialog whose owner is ALSO present in the switcher list — e.g. the
+    // "Environment Variables" dialog owned by the visible "System Properties" window. For
+    // Delphi VCL apps the visible owner is a hidden TApplication proxy that never appears in the
+    // list, so the owned dialog is retained.
+    private readonly Dictionary<IntPtr, IntPtr> _ownedDialogOwners = new();
 
     // Stable delegate instances — Win32 callbacks pin these via the lifetime of the service.
     private readonly NativeMethods.MonitorEnumProc _monitorEnumProc;
@@ -141,9 +148,10 @@ public class WindowService
     /// can reuse it (e.g. to test <see cref="NativeMethods.WS_EX_TOPMOST"/>) without a
     /// second GetWindowLongPtr round-trip.
     /// </summary>
-    private bool PassesCheapFilters(IntPtr hWnd, out long exStyle)
+    private bool PassesCheapFilters(IntPtr hWnd, out long exStyle, out IntPtr keptOwner)
     {
         exStyle = 0;
+        keptOwner = IntPtr.Zero;
         if (hWnd == _shellWindow || !NativeMethods.IsWindowVisible(hWnd))
             return false;
         if (IsCloaked(hWnd))
@@ -188,7 +196,14 @@ public class WindowService
                     // Treat owned windows that look like real dialogs (have a caption text or
                     // a dialog frame style) as user-facing and let them through.
                     if (IsLikelyUserOwnedDialog(hWnd, exStyle))
+                    {
+                        // Remember the visible owner. GetWindows() drops this dialog if the owner
+                        // itself ends up in the switcher list (modal child like System Properties →
+                        // Environment Variables). When the owner is a hidden TApplication proxy
+                        // (Delphi VCL) it never appears in the list, so the dialog is kept.
+                        keptOwner = current;
                         break;
+                    }
                     return false;
                 }
                 current = NativeMethods.GetWindow(current, NativeMethods.GW_OWNER);
@@ -215,7 +230,7 @@ public class WindowService
 
     private WindowInfo? TryGetWindowInfo(IntPtr hWnd)
     {
-        if (!PassesCheapFilters(hWnd, out var exStyle))
+        if (!PassesCheapFilters(hWnd, out var exStyle, out var keptOwner))
             return null;
 
         // Title pulled before process query — windows with no title are noise (e.g. invisible
@@ -276,7 +291,7 @@ public class WindowService
         // and break the MRU illusion. Flag them so GetWindows() can sink them to the bottom.
         bool isTopmost = (exStyle & NativeMethods.WS_EX_TOPMOST) != 0;
 
-        return new WindowInfo(title, className, processId, processName, isTopmost);
+        return new WindowInfo(title, className, processId, processName, isTopmost, keptOwner);
     }
 
     private static (bool isMinimized, bool isMaximized) GetWindowState(IntPtr hWnd)
@@ -318,6 +333,11 @@ public class WindowService
 
             _seenHandles.Add(hWnd);
             _seenProcessIds.Add(info.Value.ProcessId);
+
+            // Track owned dialogs that were kept despite a visible owner, so GetWindows() can
+            // drop them post-enumeration when the owner is itself shown (see _ownedDialogOwners).
+            if (info.Value.OwnerHandle != IntPtr.Zero)
+                _ownedDialogOwners[hWnd] = info.Value.OwnerHandle;
 
             // Topmost windows are routed to a separate bucket and appended at the tail of
             // the final list (see GetWindows()). EnumWindows reports them first regardless
@@ -373,6 +393,7 @@ public class WindowService
         _topmostScratch.Clear();
         _seenHandles.Clear();
         _seenProcessIds.Clear();
+        _ownedDialogOwners.Clear();
 
         NativeMethods.EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, _monitorEnumProc, IntPtr.Zero);
         NativeMethods.EnumWindows(_enumWindowsProc, IntPtr.Zero);
@@ -411,11 +432,31 @@ public class WindowService
         // Compose the final list: normal Z-ordered windows first (preserving MRU semantics),
         // then topmost windows at the tail. Relative order within each bucket matches the
         // EnumWindows traversal, so multiple PIP/utility windows keep a stable order.
+        // Owned dialogs whose owner is also displayed (e.g. System Properties → Environment
+        // Variables) are redundant modal children and dropped here; owned dialogs of Delphi VCL
+        // apps survive because their visible owner (a hidden TApplication proxy) is not displayed.
         var result = new List<AppWindow>(_windowsScratch.Count + _topmostScratch.Count);
-        result.AddRange(_windowsScratch);
-        result.AddRange(_topmostScratch);
+        foreach (var w in _windowsScratch)
+        {
+            if (!IsRedundantOwnedDialog(w.Handle))
+                result.Add(w);
+        }
+        foreach (var w in _topmostScratch)
+        {
+            if (!IsRedundantOwnedDialog(w.Handle))
+                result.Add(w);
+        }
         return result;
     }
+
+    /// <summary>
+    /// True when <paramref name="hWnd"/> is an owned dialog that was kept via the Delphi-VCL
+    /// compatibility path AND its visible owner is itself present in the switcher list. Such a
+    /// dialog (e.g. the "Environment Variables" window owned by the visible "System Properties"
+    /// window) is a redundant modal child and should not occupy a separate switcher entry.
+    /// </summary>
+    private bool IsRedundantOwnedDialog(IntPtr hWnd) =>
+        _ownedDialogOwners.TryGetValue(hWnd, out var owner) && _seenHandles.Contains(owner);
 
     private static bool IsCloaked(IntPtr hWnd)
     {
