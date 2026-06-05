@@ -400,7 +400,13 @@ public class MainViewModel : ObservableObject, IDisposable
 
         var currentIndex = FilteredWindows.IndexOf(windowToClose);
 
-        windowToClose.Close();
+        // Close() returns false when it only dismissed an active modal child dialog (e.g. the
+        // "Environment Variables" dialog owned by System Properties). The root window is still
+        // open in that case, so we must NOT remove it from the list — doing so unconditionally
+        // previously desynced the switcher from reality (entry gone, window still on screen).
+        bool rootClosed = windowToClose.Close();
+        if (!rootClosed)
+            return true;
 
         _windows.Remove(windowToClose);
         FilteredWindows.Remove(windowToClose);

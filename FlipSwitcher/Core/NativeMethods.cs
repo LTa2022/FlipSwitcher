@@ -269,6 +269,7 @@ internal static class NativeMethods
     public const uint LWA_ALPHA = 0x2;
 
     public const uint GW_OWNER = 4;
+    public const uint GW_ENABLEDPOPUP = 6;
     public const uint GA_ROOTOWNER = 3;
 
     public const int SW_RESTORE = 9;

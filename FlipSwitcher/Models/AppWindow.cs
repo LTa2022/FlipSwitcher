@@ -471,17 +471,40 @@ public class AppWindow : INotifyPropertyChanged
     }
 
     /// <summary>
-    /// Close this window by sending WM_CLOSE message.
+    /// Close this window by sending WM_CLOSE.
     /// </summary>
-    public void Close()
+    /// <remarks>
+    /// Special case: when this window owns an active modal dialog (e.g. System Properties showing
+    /// its "Environment Variables" dialog), the root window is <c>EnableWindow(FALSE)</c>-disabled
+    /// and WM_CLOSE posted to it is silently ignored — the window would never actually close while
+    /// the switcher optimistically removed it from the list. In that case we redirect WM_CLOSE to
+    /// the active popup (the dialog the user actually sees) so the close takes effect.
+    /// </remarks>
+    /// <returns>
+    /// <c>true</c> if the root window itself was targeted (the caller may remove it from the list);
+    /// <c>false</c> if only an owned modal dialog was dismissed and the root window remains open.
+    /// </returns>
+    public bool Close()
     {
         try
         {
-            NativeMethods.PostMessage(Handle, NativeMethods.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+            // GW_ENABLEDPOPUP returns the active (enabled) popup owned by this window, or the
+            // window itself when there is none. See <remarks> for the modal-dialog rationale.
+            var popup = NativeMethods.GetWindow(Handle, NativeMethods.GW_ENABLEDPOPUP);
+            bool hasModalPopup =
+                popup != IntPtr.Zero &&
+                popup != Handle &&
+                NativeMethods.IsWindowVisible(popup);
+
+            var target = hasModalPopup ? popup : Handle;
+            NativeMethods.PostMessage(target, NativeMethods.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+
+            return !hasModalPopup;
         }
         catch
         {
-            // Ignore errors when closing window.
+            // On failure assume the root was targeted so list/intent stay consistent.
+            return true;
         }
     }
 
