@@ -347,6 +347,15 @@ public class AppWindow : INotifyPropertyChanged
         var currentThreadId = NativeMethods.GetCurrentThreadId();
         var targetThreadId = NativeMethods.GetWindowThreadProcessId(Handle, out _);
 
+        // Resolve the window that should actually receive foreground focus. When the root
+        // window owns a visible popup (a modal dialog, login prompt, open/save dialog, etc.)
+        // Windows treats that popup as the window the user interacts with — the real Alt-Tab
+        // activates the popup, not the root. Focusing the root here would leave the dialog
+        // unfocused, forcing the user to click it before typing. Mirror the OS behavior by
+        // foreground-targeting the last active popup when one exists. The root Handle is still
+        // used for restore/maximize below since that operates on the top-level window.
+        var activationTarget = ResolveActivationTarget();
+
         // Avoid modifying global SPI_SETFOREGROUNDLOCKTIMEOUT to prevent permanently altering system behavior on crash.
         NativeMethods.AllowSetForegroundWindow(NativeMethods.ASFW_ANY);
         NativeMethods.LockSetForegroundWindow(NativeMethods.LSFW_UNLOCK);
@@ -388,28 +397,28 @@ public class AppWindow : INotifyPropertyChanged
                 NativeMethods.ShowWindow(Handle, NativeMethods.SW_SHOWMAXIMIZED);
             }
 
-            NativeMethods.BringWindowToTop(Handle);
-            NativeMethods.SetForegroundWindow(Handle);
+            NativeMethods.BringWindowToTop(activationTarget);
+            NativeMethods.SetForegroundWindow(activationTarget);
 
-            if (NativeMethods.GetForegroundWindow() != Handle)
+            if (NativeMethods.GetForegroundWindow() != activationTarget)
             {
                 NativeMethods.keybd_event(NativeMethods.VK_ALT, 0, NativeMethods.KEYEVENTF_EXTENDEDKEY, UIntPtr.Zero);
                 NativeMethods.keybd_event(NativeMethods.VK_ALT, 0, NativeMethods.KEYEVENTF_EXTENDEDKEY | NativeMethods.KEYEVENTF_KEYUP, UIntPtr.Zero);
 
-                NativeMethods.SetForegroundWindow(Handle);
-                NativeMethods.BringWindowToTop(Handle);
+                NativeMethods.SetForegroundWindow(activationTarget);
+                NativeMethods.BringWindowToTop(activationTarget);
             }
 
-            if (NativeMethods.GetForegroundWindow() != Handle)
+            if (NativeMethods.GetForegroundWindow() != activationTarget)
             {
-                NativeMethods.SwitchToThisWindow(Handle, true);
+                NativeMethods.SwitchToThisWindow(activationTarget, true);
             }
 
-            if (NativeMethods.GetForegroundWindow() != Handle)
+            if (NativeMethods.GetForegroundWindow() != activationTarget)
             {
-                NativeMethods.SetWindowPos(Handle, NativeMethods.HWND_TOPMOST, 0, 0, 0, 0,
+                NativeMethods.SetWindowPos(activationTarget, NativeMethods.HWND_TOPMOST, 0, 0, 0, 0,
                     NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_SHOWWINDOW);
-                NativeMethods.SetWindowPos(Handle, NativeMethods.HWND_NOTOPMOST, 0, 0, 0, 0,
+                NativeMethods.SetWindowPos(activationTarget, NativeMethods.HWND_NOTOPMOST, 0, 0, 0, 0,
                     NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_SHOWWINDOW);
             }
         }
@@ -421,7 +430,7 @@ public class AppWindow : INotifyPropertyChanged
                 {
                     NativeMethods.ShowWindow(Handle, NativeMethods.SW_RESTORE);
                 }
-                NativeMethods.SwitchToThisWindow(Handle, true);
+                NativeMethods.SwitchToThisWindow(activationTarget, true);
             }
             catch
             {
@@ -439,6 +448,33 @@ public class AppWindow : INotifyPropertyChanged
                 NativeMethods.AttachThreadInput(currentThreadId, targetThreadId, false);
             }
         }
+    }
+
+    /// <summary>
+    /// Returns the HWND that should receive foreground focus when this entry is activated.
+    /// </summary>
+    /// <remarks>
+    /// When the root window owns a visible popup (modal dialog, login prompt, open/save dialog,
+    /// MessageBox, etc.), the OS Alt-Tab activates that popup rather than the root — that popup
+    /// is what the user actually types into. <see cref="NativeMethods.GetLastActivePopup"/>
+    /// returns the most recently active popup owned by <see cref="Handle"/>, or <see cref="Handle"/>
+    /// itself when there is none. We only redirect when the popup is a different, visible window so
+    /// hidden/stale popups never steal activation. Without this, focus lands on the parent and the
+    /// user must click the dialog before it accepts keyboard input.
+    /// </remarks>
+    private IntPtr ResolveActivationTarget()
+    {
+        try
+        {
+            var popup = NativeMethods.GetLastActivePopup(Handle);
+            if (popup != IntPtr.Zero && popup != Handle && NativeMethods.IsWindowVisible(popup))
+                return popup;
+        }
+        catch
+        {
+            // Fall back to the root window on any failure.
+        }
+        return Handle;
     }
 
     public bool MatchesFilter(string filter)
