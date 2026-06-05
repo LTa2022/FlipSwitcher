@@ -287,7 +287,7 @@ public partial class MainWindow : Window
         ScrollSelectedIntoView();
     }
 
-    private void ShowWindow()
+    private async void ShowWindow()
     {
         // Reset grouping state to ensure the full list is shown
         _viewModel.ResetGrouping();
@@ -300,10 +300,10 @@ public partial class MainWindow : Window
         if (openSearchDirectly)
             _isAltTabMode = false;
 
-        // Refresh window list - in Alt+Tab mode, select the second window
-        // (the first window is the current one, user wants to switch to another)
-        _viewModel.RefreshWindows(selectSecondWindow: _isAltTabMode);
-
+        // Position and show the window FIRST so it appears instantly. The (potentially slow)
+        // window enumeration then runs on a background thread and populates the list a moment
+        // later — it no longer blocks the window from painting. The list briefly shows the
+        // previous session's contents until RefreshWindowsAsync completes (typically <1 frame).
         if (SettingsService.Instance.Settings.ShowOnMouseScreen)
         {
             PositionOnMouseScreen();
@@ -335,8 +335,14 @@ public partial class MainWindow : Window
             }
         }
 
-        // Delay scroll execution to ensure layout is complete
-        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded, new Action(() =>
+        // Refresh window list off the UI thread - in Alt+Tab mode, select the second window
+        // (the first window is the current one, user wants to switch to another). Selection
+        // is applied after enumeration completes, before the user releases Alt in practice.
+        await _viewModel.RefreshWindowsAsync(selectSecondWindow: _isAltTabMode);
+
+        // Delay scroll execution to ensure layout is complete. Fire-and-forget: DispatcherOperation
+        // is awaitable, so discard it to avoid CS4014 now that ShowWindow is async.
+        _ = Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded, new Action(() =>
         {
             ScrollToTopThenSelected();
         }));

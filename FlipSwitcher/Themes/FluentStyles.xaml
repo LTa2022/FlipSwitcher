@@ -323,7 +323,12 @@
         <Setter Property="Template">
             <Setter.Value>
                 <ControlTemplate TargetType="ListBox">
+                    <!-- CanContentScroll=True is REQUIRED for UI virtualization. Without it the
+                         ScrollViewer scrolls by physical pixels, gives the VirtualizingStackPanel
+                         infinite height, and every item gets realized regardless of the
+                         VirtualizingPanel.IsVirtualizing settings on the ListBox itself. -->
                     <ScrollViewer Focusable="False"
+                                  CanContentScroll="True"
                                   Padding="{TemplateBinding Padding}"
                                   Style="{StaticResource FluentScrollViewerStyle}">
                         <ItemsPresenter/>

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Linq;
+using System.Threading.Tasks;
 using System.Windows.Input;
 using System.Windows.Threading;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -240,7 +241,50 @@ public class MainViewModel : ObservableObject, IDisposable
         _searchDebounceTimer.Stop();
 
         _windows = _windowService.GetWindows();
+        ApplyRefreshedWindows(selectSecondWindow);
+    }
 
+    // Guards against overlapping background enumerations. WindowService reuses mutable scratch
+    // buffers and is NOT thread-safe, so only one GetWindows() may run at a time. Rapid
+    // open/close toggles could otherwise enter RefreshWindowsAsync concurrently.
+    private bool _isRefreshing;
+
+    /// <summary>
+    /// Refresh the window list, running the expensive <see cref="WindowService.GetWindows"/>
+    /// enumeration on a background thread so the switcher window can paint immediately.
+    /// The collection/selection update resumes on the UI thread (no ConfigureAwait(false)).
+    /// </summary>
+    /// <param name="selectSecondWindow">If true, select the second window (Alt+Tab behavior).</param>
+    public async Task RefreshWindowsAsync(bool selectSecondWindow = false)
+    {
+        if (_isRefreshing)
+            return;
+
+        _isRefreshing = true;
+        try
+        {
+            // Cancel any pending debounced filter — we're refreshing now.
+            _searchDebounceTimer.Stop();
+
+            // EnumWindows + per-window Win32/DWM calls are the slow part and touch no WPF objects,
+            // so they run off the UI thread. The AppWindow instances created here are plain models;
+            // their icons still load lazily/async via the Icon getter.
+            _windows = await Task.Run(() => _windowService.GetWindows());
+
+            ApplyRefreshedWindows(selectSecondWindow);
+        }
+        finally
+        {
+            _isRefreshing = false;
+        }
+    }
+
+    /// <summary>
+    /// Apply the freshly enumerated <see cref="_windows"/> to the bound collection and selection.
+    /// Must run on the UI thread.
+    /// </summary>
+    private void ApplyRefreshedWindows(bool selectSecondWindow)
+    {
         // If in grouped mode, maintain the grouping state.
         if (_isGroupedByProcess && _groupedProcessName != null)
         {
