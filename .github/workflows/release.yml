@@ -69,14 +69,18 @@ jobs:
             if (Test-Path "$p\ISCC.exe") {
               echo "PATH=$p" >> $env:GITHUB_OUTPUT
               
-              # Download Chinese language files
-              $langDir = "$p\Languages"
+              # Copy bundled Chinese language files into the Inno Setup compiler directory.
+              $langDir = Join-Path $p "Languages"
+              New-Item -ItemType Directory -Path $langDir -Force | Out-Null
+              $repoLangDir = Join-Path $env:GITHUB_WORKSPACE "FlipSwitcher\InnoSetupLanguages"
               @("ChineseSimplified", "ChineseTraditional") | ForEach-Object {
-                $file = "$langDir\$_.isl"
-                if (-not (Test-Path $file)) {
-                  $url = "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/$_.isl"
-                  Invoke-WebRequest -Uri $url -OutFile $file -UseBasicParsing -ErrorAction SilentlyContinue
+                $source = Join-Path $repoLangDir "$_.isl"
+                $target = Join-Path $langDir "$_.isl"
+                if (-not (Test-Path $source)) {
+                  Write-Error "Bundled Inno Setup language file not found: $source"
+                  exit 1
                 }
+                Copy-Item -LiteralPath $source -Destination $target -Force
               }
               return
             }
