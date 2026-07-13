@@ -107,7 +107,7 @@
                 Background="{DynamicResource BackgroundSolidBaseBrush}">
                 <Grid>
                     <DockPanel>
-                        <ListBox x:Name="WindowList" DockPanel.Dock="Left"
+                        <ListBox x:Name="WindowList" DockPanel.Dock="Left" Width="400"
                         ItemsSource="{Binding FilteredWindows}"
                         SelectedItem="{Binding SelectedWindow, Mode=TwoWay}"
                         Style="{DynamicResource FluentListBoxStyle}"
@@ -244,7 +244,7 @@
                                 </DataTemplate>
                             </ListBox.ItemTemplate>
                         </ListBox>
-                        <FlipSwitcher:DwmThumbnailViewer x:Name="DwmThumbnailViewer" DockPanel.Dock="Right" Height="300" Width="400"/>
+                        <FlipSwitcher:DwmThumbnailViewer x:Name="DwmThumbnailViewer" DockPanel.Dock="Right" />
 
                     </DockPanel>
                     <!-- Windows List -->
