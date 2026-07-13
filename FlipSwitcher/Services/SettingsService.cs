@@ -83,6 +83,7 @@ public class AppSettings
     /// Use Alt+Space as the activation hotkey
     /// </summary>
     public bool UseAltSpace { get; set; } = false;
+    public bool Fullscreen { get; set; } = true;
 
     /// <summary>
     /// Start with Windows

@@ -141,6 +141,7 @@ public partial class SettingsWindow : Window
         FollowSystemThemeCheckBox.IsChecked = settings.FollowSystemTheme;
         ThemeComboBox.SelectedIndex = (int)settings.Theme;
         CheckForUpdatesCheckBox.IsChecked = settings.CheckForUpdates;
+        cbxFullscreen.IsChecked = settings.Fullscreen;
 
         UpdateThemeControlsState();
         UpdateCurrentHotkeyDisplay();
@@ -562,6 +563,17 @@ public partial class SettingsWindow : Window
             _hotkeyService.EscapePressed -= HotkeyService_EscapePressed;
         }
         base.OnClosed(e);
+    }
+
+    private void cbxFullscreen_Checked(object sender, RoutedEventArgs e)
+    {
+        SaveSetting((s, v) => s.Fullscreen = v, cbxFullscreen.IsChecked == true);
+    }
+
+    private void cbxFullscreen_Unchecked(object sender, RoutedEventArgs e)
+    {
+        SaveSetting((s, v) => s.Fullscreen = v, cbxFullscreen.IsChecked == true);
+
     }
 }
 

@@ -66,7 +66,6 @@ public partial class MainWindow : Window
         {
             hwndSource.AddHook(WndProc);
         }
-
         // Initially hide the window
         Hide();
     }
@@ -95,7 +94,10 @@ public partial class MainWindow : Window
         // Re-register hotkeys when settings change
         var settings = SettingsService.Instance.Settings;
         _hotkeyService.RegisterHotkeys(this, settings.UseAltSpace, settings.UseAltTab);
-        
+
+        this.WindowState = settings.Fullscreen ? WindowState.Maximized : WindowState.Minimized;
+
+
         // Update hotkey display
         UpdateHotkeyDisplay();
     }
