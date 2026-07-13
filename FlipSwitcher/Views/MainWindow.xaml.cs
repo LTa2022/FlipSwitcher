@@ -615,4 +615,41 @@ public partial class MainWindow : Window
         _isClosing = true;
         Close();
     }
+
+
+    #region Remove the Window ALT menu (alt space a window for example)
+
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+        HwndSource source = HwndSource.FromVisual(this) as HwndSource;
+        if (source != null)
+        {
+            source.AddHook(new HwndSourceHook(WinProc));
+        }
+    }
+
+    public const Int32 SC_KEYMENU = 0xf100;
+
+    public const Int32 WM_SYSCOMMAND = 0x112;
+
+    private IntPtr WinProc(IntPtr hwnd, Int32 msg, IntPtr wParam, IntPtr lParam, ref Boolean handled)
+    {
+        switch (msg)
+        {
+            case WM_SYSCOMMAND:
+                int sc = (LOWORD(wParam.ToInt32()) & 0xFFF0);
+                handled = sc == SC_KEYMENU;
+                break;
+        }
+
+        return new IntPtr(1);
+    }
+
+    public static Int32 LOWORD(Int32 n)
+    {
+        return (n & 0xffff);
+    }
+
+    #endregion
 }
