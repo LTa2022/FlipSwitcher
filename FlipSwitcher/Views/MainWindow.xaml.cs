@@ -4,6 +4,7 @@ using System.Windows;
 using System.Windows.Input;
 using System.Windows.Interop;
 using FlipSwitcher.Core;
+using FlipSwitcher.Models;
 using FlipSwitcher.Services;
 using FlipSwitcher.ViewModels;
 
@@ -440,13 +441,7 @@ public partial class MainWindow : Window
 
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
-        switch (e.SystemKey)
-        {
-            case  Key.LeftAlt:
-                ActivateSelectedWindow();
-                e.Handled = true;
-                break;
-        }
+     
         switch (e.Key)
         {
             case Key.Escape:
@@ -655,4 +650,24 @@ public partial class MainWindow : Window
     }
 
     #endregion
+
+    private void Window_PreviewKeyUp(object sender, KeyEventArgs e)
+    {
+        switch (e.SystemKey)
+        {
+            case Key.LeftAlt:   
+                ActivateSelectedWindow();
+                e.Handled = true;
+                break;
+        }
+    }
+
+    private void Border_MouseEnter(object sender, MouseEventArgs e)
+    {
+        AppWindow aw = (sender as FrameworkElement).DataContext as AppWindow;
+        var h = aw.Handle;
+
+        DwmThumbnailViewer.TargetHwnd = h; 
+
+    }
 }
