@@ -440,6 +440,13 @@ public partial class MainWindow : Window
 
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
+        switch (e.SystemKey)
+        {
+            case  Key.LeftAlt:
+                ActivateSelectedWindow();
+                e.Handled = true;
+                break;
+        }
         switch (e.Key)
         {
             case Key.Escape:
@@ -447,11 +454,7 @@ public partial class MainWindow : Window
                 e.Handled = true;
                 break;
 
-            case Key.Enter:
-                ActivateSelectedWindow();
-                e.Handled = true;
-                break;
-
+          
             case Key.Up:
                 _viewModel.MoveSelectionUp();
                 ScrollSelectedIntoView();
@@ -500,7 +503,7 @@ public partial class MainWindow : Window
                 }
                 break;
 
-            case Key.D:
+            case Key.Q:
                 // Alt+D to stop selected process
                 if (Keyboard.Modifiers == ModifierKeys.Alt)
                 {
